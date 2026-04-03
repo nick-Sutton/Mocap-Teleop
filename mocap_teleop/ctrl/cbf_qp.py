@@ -187,7 +187,15 @@ class CBFQP:
                              self.robot_half_length, self.robot_half_width)
                 for obs in obstacles
             ])                                          # (n, 2)
-            l_cbf = np.array([-a for a in alphas])     # (n,) lower bounds
+            # Standard class K CBF: ∂h/∂x · u ≥ −α · h(x)
+            # RHS = −α·h(x), clamped so we never require ḣ < 0 when already safe
+            h_vals = np.array([
+                cbf_value(p_robot, obs.center, yaw, obs.radius,
+                          self.robot_half_length, self.robot_half_width)
+                for obs in obstacles
+            ])
+            l_cbf = np.array([-a * max(h, 0.0)
+                               for a, h in zip(alphas, h_vals)])  # (n,)
 
             A_full = sp.csc_matrix(np.vstack([A_cbf, np.eye(2)]))
             l_full = np.concatenate([l_cbf,          [-self.v_max, -self.v_max]])
@@ -254,50 +262,32 @@ class CBFQP:
         """
         from qpth.qp import QPFunction
 
-        _ZETA = 1e2   # slack penalty: large enough δ≈0, small enough QP is well-scaled
-
         B     = u_perf_world_t.shape[0]
         n_obs = A_cbf_t.shape[1]
         dev   = u_perf_world_t.device
 
-        # ── Optimisation variable: [u (2), δ (1)] ────────────────────────────
-        # Cost: ‖u − u_perf‖² + ζ·δ² = uᵀu − 2·u_perfᵀu + ζ·δ²
-        # In [u; δ] coords: Q_aug = diag(2I, 2ζ), p_aug = [-2·u_perf; 0]
-        Q_aug = torch.zeros(B, 3, 3, device=dev)
-        Q_aug[:, 0, 0] = 2.0
-        Q_aug[:, 1, 1] = 2.0
-        Q_aug[:, 2, 2] = 2.0 * _ZETA
-        # Small regularisation for numerical stability
-        Q_aug = Q_aug + 1e-6 * torch.eye(3, device=dev).unsqueeze(0)
+        # ── Optimisation variable: u ∈ ℝ² ────────────────────────────────────
+        # No slack needed: u=0 always satisfies A_cbf·u = 0 ≥ −α (since α > 0)
+        # Cost: ‖u − u_perf‖² → Q = 2I (qpth uses ½uᵀQu), p = −2·u_perf
+        Q = (2.0 * torch.eye(2, device=dev)
+             + 1e-6 * torch.eye(2, device=dev)).unsqueeze(0).expand(B, -1, -1)
+        p = -2.0 * u_perf_world_t                             # (B, 2)
 
-        p_aug = torch.zeros(B, 3, device=dev)
-        p_aug[:, :2] = -2.0 * u_perf_world_t
+        # ── Inequality constraints G·u ≤ h ────────────────────────────────────
+        # CBF:  −A_cbf·u ≤ alphas    [n_obs rows]  (= A_cbf·u ≥ −alphas = b_cbf)
+        # Box:   ±I·u   ≤ v_max      [4 rows]
+        G_cbf = -A_cbf_t                                      # (B, n_obs, 2)
+        h_cbf = -b_cbf_t                                      # (B, n_obs)  = alphas
 
-        # ── Inequality constraints G·[u;δ] ≤ h ───────────────────────────────
-        # CBF (relaxed): −A_cbf·u + (−1)·δ ≤ −b_cbf   [n_obs rows]
-        # Box:           ±I·u + 0·δ ≤ v_max            [4 rows]
-        # δ ≥ 0:         0·u − δ ≤ 0                   [1 row]
-        G_cbf  = torch.zeros(B, n_obs, 3, device=dev)
-        G_cbf[:, :, :2] = -A_cbf_t                    # −A_cbf on u
-        G_cbf[:, :,  2] = -1.0                        # −δ (relaxation)
-        h_cbf  = -b_cbf_t                             # (B, n_obs)
+        I2    = torch.eye(2, device=dev).unsqueeze(0).expand(B, -1, -1)
+        G_box = torch.cat([ I2, -I2], dim=1)                  # (B, 4, 2)
+        h_box = torch.full((B, 4), self.v_max, device=dev)
 
-        I2     = torch.eye(2, device=dev).unsqueeze(0).expand(B, -1, -1)
-        G_box  = torch.zeros(B, 4, 3, device=dev)
-        G_box[:, :2, :2] =  I2
-        G_box[:, 2:, :2] = -I2
-        h_box  = torch.full((B, 4), self.v_max, device=dev)
-
-        G_slack       = torch.zeros(B, 1, 3, device=dev)
-        G_slack[:, 0, 2] = -1.0                       # −δ ≤ 0  (δ ≥ 0)
-        h_slack        = torch.zeros(B, 1, device=dev)
-
-        G = torch.cat([G_cbf, G_box, G_slack], dim=1)   # (B, n_obs+5, 3)
-        h = torch.cat([h_cbf, h_box, h_slack], dim=1)   # (B, n_obs+5)
+        G = torch.cat([G_cbf, G_box], dim=1)                  # (B, n_obs+4, 2)
+        h = torch.cat([h_cbf, h_box], dim=1)                  # (B, n_obs+4)
 
         # Empty equality constraints
-        A_eq = torch.zeros(B, 0, 3, device=dev)
+        A_eq = torch.zeros(B, 0, 2, device=dev)
         b_eq = torch.zeros(B, 0,    device=dev)
 
-        sol = QPFunction(verbose=False)(Q_aug, p_aug, G, h, A_eq, b_eq)  # (B, 3)
-        return sol[:, :2]   # discard δ, return u in world frame
+        return QPFunction(verbose=False)(Q, p, G, h, A_eq, b_eq)  # (B, 2)

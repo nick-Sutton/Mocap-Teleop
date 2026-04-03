@@ -97,6 +97,10 @@ def _rollout_batch(
         np.array([[obs.radius for obs in ep.obstacles] for ep in episodes]),
         dtype=torch.float32, device=device)
 
+    # Per-episode normalisation: divide by initial squared distance to goal so
+    # that hard episodes (far start-goal) don't dominate the gradient signal.
+    dist0_sq = torch.sum((pos - goals) ** 2, dim=1).clamp(min=1e-3)  # (B,)
+
     loss = torch.zeros(1, device=device)
 
     for _ in range(_T):
@@ -165,7 +169,15 @@ def _rollout_batch(
                   else 10)
 
         alphas_flat = alpha_net(feat).reshape(B, n_obs)   # (B, n_obs)
-        b_cbf_t     = -alphas_flat                         # (B, n_obs)
+
+        # Standard CBF class K constraint: ∂h/∂x · u ≥ −α · h(x)
+        # RHS scales with current barrier value so constraint tightens
+        # as the robot approaches the obstacle boundary (h → 0).
+        Q_t_now = torch.tensor(Q_np, dtype=torch.float32, device=device)
+        d_now   = pos.detach().unsqueeze(1) - centers     # (B, n_obs, 2)
+        h_now   = (torch.einsum('bni,bnij,bnj->bn', d_now, Q_t_now, d_now)
+                   - 1.0)                                  # (B, n_obs)
+        b_cbf_t = -alphas_flat * h_now.clamp(min=0.0)     # (B, n_obs)
 
         # ── Batched differentiable CBF-QP ─────────────────────────────────
         u_safe_world = cbf_qp.solve_differentiable_batch(
@@ -174,14 +186,17 @@ def _rollout_batch(
         # ── Kinematic integration ─────────────────────────────────────────
         pos = pos + u_safe_world * _DT                     # (B, 2)
 
-        # ── Performance loss ──────────────────────────────────────────────
-        loss = loss + torch.sum((pos - goals) ** 2)
+        # ── Performance loss (normalised per episode) ─────────────────────
+        per_ep = torch.sum((pos - goals) ** 2, dim=1) / dist0_sq  # (B,)
+        loss   = loss + torch.sum(per_ep)
 
-        # ── Soft CBF violation penalty ────────────────────────────────────
+        # ── Soft CBF violation penalty (normalised) ────────────────────────
         Q_t    = torch.tensor(Q_np, dtype=torch.float32, device=device) # (B,n_obs,2,2)
         d_obs  = pos.unsqueeze(1) - centers                              # (B,n_obs,2)
         h_vals = torch.einsum('bni,bnij,bnj->bn', d_obs, Q_t, d_obs) - 1.0
-        loss   = loss + _SLACK_WEIGHT * torch.sum(torch.relu(-h_vals) ** 2)
+        viol   = _SLACK_WEIGHT * torch.sum(
+            torch.relu(-h_vals) ** 2, dim=1) / dist0_sq               # (B,)
+        loss   = loss + torch.sum(viol)
 
     return loss / B
 
