@@ -266,54 +266,42 @@ class CBFQP:
         n_obs = A_cbf_t.shape[1]
         dev   = u_perf_world_t.device
 
-        # ── Differentiable projection via Dykstra's algorithm ────────────────
+        # ── Softplus-smoothed CBF correction ─────────────────────────────────
         #
-        # Solving  min ‖u − u_perf‖²  s.t.  A_cbf·u ≥ b_cbf, ‖u‖∞ ≤ v_max
-        # is equivalent to projecting u_perf onto the intersection of:
-        #   • n_obs half-spaces  {u : a_i·u ≥ b_i}
-        #   • a box              {u : −v_max ≤ u_j ≤ v_max}
+        # Hard projection (Dykstra/qpth) gives zero gradient when constraints
+        # are inactive — the α-net never gets a training signal when the robot
+        # is far from an obstacle, so it can't learn from scratch.
         #
-        # Dykstra's algorithm alternates projections onto each constraint set.
-        # Each projection is a closed-form PyTorch operation → fully
-        # differentiable via autograd, GPU-native, zero numerical issues.
+        # Instead we use a smooth approximation:
         #
-        # Convergence: typically < 15 iterations for our small (2D, ≤3 obs)
-        # problem.  The box projection is exact; the half-space projection is
-        # exact.  Dykstra converges to the true QP optimum for convex sets.
+        #   violation_i = softplus(b_i − a_i·u_perf, β)
+        #                ≈ max(0, b_i − a_i·u_perf)   but smooth everywhere
+        #
+        #   u_safe = u_perf + Σ_i (violation_i / ‖a_i‖²) · a_i
+        #          = u_perf + total correction toward satisfying all CBF constraints
+        #
+        # softplus has non-zero gradient everywhere → α-net always receives a
+        # training signal through b_i = −α·h(x) regardless of constraint status.
+        # At deployment we use OSQP (exact) so this approximation only affects
+        # training.
+        #
+        # β controls sharpness: high β → closer to exact hard projection,
+        # lower β → smoother gradients (better for early training).
 
-        _N_ITER = 20   # more than enough for 2D + small n_obs
+        _BETA = 5.0
 
-        u = u_perf_world_t.clone()   # (B, 2) — initialise at u_perf
+        n_cbf = A_cbf_t.shape[1]
+        u     = u_perf_world_t.clone()   # (B, 2)
 
-        # Dykstra increment tensors (one per constraint set)
-        # increments accumulate the "memory" that makes Dykstra exact vs.
-        # simple alternating projections which can overshoot.
-        n_cbf   = A_cbf_t.shape[1]
-        p_cbf   = torch.zeros_like(A_cbf_t[:, :, 0])   # (B, n_cbf) — one per CBF row
-        p_box   = torch.zeros_like(u)                    # (B, 2)
+        for i in range(n_cbf):
+            a    = A_cbf_t[:, i, :]                          # (B, 2)
+            b    = b_cbf_t[:, i]                             # (B,)
+            dot  = (a * u).sum(-1)                           # (B,)
+            a_sq = (a * a).sum(-1).clamp(min=1e-8)           # (B,)
+            # Smooth violation — non-zero even when constraint is satisfied
+            viol = torch.nn.functional.softplus(b - dot, beta=_BETA)  # (B,)
+            # Correct u toward constraint satisfaction
+            u    = u + (viol / a_sq).unsqueeze(-1) * a
 
-        for _ in range(_N_ITER):
-            # ── Project onto each CBF half-space: a_i·u ≥ b_i ───────────────
-            for i in range(n_cbf):
-                a_i   = A_cbf_t[:, i, :]                    # (B, 2)
-                b_i   = b_cbf_t[:, i]                       # (B,)
-                y     = u + p_cbf[:, i].unsqueeze(-1) * a_i # Dykstra shift
-                # dot  = a_i · y
-                dot   = (a_i * y).sum(-1)                   # (B,)
-                a_sq  = (a_i * a_i).sum(-1).clamp(min=1e-8) # (B,)
-                # violation: how much constraint is violated
-                viol  = torch.relu(b_i - dot)               # (B,), ≥ 0
-                # project: u_proj = y + (viol / ‖a‖²) · a
-                u     = y + (viol / a_sq).unsqueeze(-1) * a_i
-                # update Dykstra increment
-                p_cbf = p_cbf.clone()
-                p_cbf[:, i] = p_cbf[:, i] + (u - y).norm(dim=-1).detach() * 0.0
-                # (increment update absorbed into p_cbf is zero here because
-                #  we track it implicitly via the projection residual)
-
-            # ── Project onto box: −v_max ≤ u_j ≤ v_max ──────────────────────
-            y   = u + p_box
-            u   = y.clamp(-self.v_max, self.v_max)
-            p_box = p_box + y - u          # Dykstra box increment
-
-        return u
+        # Box constraint — hard clip is fine, α-net doesn't depend on v_max
+        return u.clamp(-self.v_max, self.v_max)
