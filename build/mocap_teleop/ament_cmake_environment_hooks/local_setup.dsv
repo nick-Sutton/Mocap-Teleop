@@ -1,0 +1,3 @@
+source;share/mocap_teleop/environment/ament_prefix_path.sh
+source;share/mocap_teleop/environment/path.sh
+source;share/mocap_teleop/environment/pythonpath.sh

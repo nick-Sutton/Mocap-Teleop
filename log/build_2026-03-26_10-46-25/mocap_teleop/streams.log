@@ -1,0 +1,123 @@
+[0.017s] Invoking command in '/home/nwsutton/ros_ws/src/mocap_teleop/build/mocap_teleop': CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}:/opt/ros/jazzy:/home/*your_unity_id*/*your_workspace_name*/install/csc495_003_p1_tfsexport DEBUGINFOD_URLS=https://debuginfod.fedoraproject.org/ PS1=\[\e[1m\]\u@\h\[\e[0m\][./\W]\[\e[1m\]\\$\[\e[0m\] /usr/bin/cmake /home/nwsutton/ros_ws/src/mocap_teleop -DCMAKE_INSTALL_PREFIX=/home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop
+[0.205s] -- The C compiler identification is GNU 13.3.0
+[0.342s] -- The CXX compiler identification is GNU 13.3.0
+[0.379s] -- Detecting C compiler ABI info
+[0.562s] -- Detecting C compiler ABI info - done
+[0.579s] -- Check for working C compiler: /usr/bin/cc - skipped
+[0.579s] -- Detecting C compile features
+[0.580s] -- Detecting C compile features - done
+[0.598s] -- Detecting CXX compiler ABI info
+[0.789s] -- Detecting CXX compiler ABI info - done
+[0.806s] -- Check for working CXX compiler: /usr/bin/c++ - skipped
+[0.806s] -- Detecting CXX compile features
+[0.807s] -- Detecting CXX compile features - done
+[0.816s] -- Found ament_cmake: 2.5.5 (/opt/ros/jazzy/share/ament_cmake/cmake)
+[1.033s] -- Found Python3: /usr/bin/python3 (found version "3.12.3") found components: Interpreter 
+[1.369s] -- Configuring done (1.3s)
+[1.375s] -- Generating done (0.0s)
+[1.377s] -- Build files have been written to: /home/nwsutton/ros_ws/src/mocap_teleop/build/mocap_teleop
+[1.383s] Invoked command in '/home/nwsutton/ros_ws/src/mocap_teleop/build/mocap_teleop' returned '0': CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}:/opt/ros/jazzy:/home/*your_unity_id*/*your_workspace_name*/install/csc495_003_p1_tfsexport DEBUGINFOD_URLS=https://debuginfod.fedoraproject.org/ PS1=\[\e[1m\]\u@\h\[\e[0m\][./\W]\[\e[1m\]\\$\[\e[0m\] /usr/bin/cmake /home/nwsutton/ros_ws/src/mocap_teleop -DCMAKE_INSTALL_PREFIX=/home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop
+[1.384s] Invoking command in '/home/nwsutton/ros_ws/src/mocap_teleop/build/mocap_teleop': CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}:/opt/ros/jazzy:/home/*your_unity_id*/*your_workspace_name*/install/csc495_003_p1_tfsexport DEBUGINFOD_URLS=https://debuginfod.fedoraproject.org/ PS1=\[\e[1m\]\u@\h\[\e[0m\][./\W]\[\e[1m\]\\$\[\e[0m\] /usr/bin/cmake --build /home/nwsutton/ros_ws/src/mocap_teleop/build/mocap_teleop -- -j16 -l16
+[1.450s] Built target ament_cmake_python_copy_mocap_teleop
+[1.622s] running egg_info
+[1.622s] creating mocap_teleop.egg-info
+[1.636s] writing mocap_teleop.egg-info/PKG-INFO
+[1.636s] writing dependency_links to mocap_teleop.egg-info/dependency_links.txt
+[1.636s] writing top-level names to mocap_teleop.egg-info/top_level.txt
+[1.636s] writing manifest file 'mocap_teleop.egg-info/SOURCES.txt'
+[1.680s] reading manifest file 'mocap_teleop.egg-info/SOURCES.txt'
+[1.680s] writing manifest file 'mocap_teleop.egg-info/SOURCES.txt'
+[1.709s] Built target ament_cmake_python_build_mocap_teleop_egg
+[1.721s] Invoked command in '/home/nwsutton/ros_ws/src/mocap_teleop/build/mocap_teleop' returned '0': CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}:/opt/ros/jazzy:/home/*your_unity_id*/*your_workspace_name*/install/csc495_003_p1_tfsexport DEBUGINFOD_URLS=https://debuginfod.fedoraproject.org/ PS1=\[\e[1m\]\u@\h\[\e[0m\][./\W]\[\e[1m\]\\$\[\e[0m\] /usr/bin/cmake --build /home/nwsutton/ros_ws/src/mocap_teleop/build/mocap_teleop -- -j16 -l16
+[1.733s] Invoking command in '/home/nwsutton/ros_ws/src/mocap_teleop/build/mocap_teleop': CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}:/opt/ros/jazzy:/home/*your_unity_id*/*your_workspace_name*/install/csc495_003_p1_tfsexport DEBUGINFOD_URLS=https://debuginfod.fedoraproject.org/ PS1=\[\e[1m\]\u@\h\[\e[0m\][./\W]\[\e[1m\]\\$\[\e[0m\] /usr/bin/cmake --install /home/nwsutton/ros_ws/src/mocap_teleop/build/mocap_teleop
+[1.741s] -- Install configuration: ""
+[1.741s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/share/mocap_teleop/environment/pythonpath.sh
+[1.741s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/share/mocap_teleop/environment/pythonpath.dsv
+[1.741s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop-0.0.1-py3.12.egg-info
+[1.741s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop-0.0.1-py3.12.egg-info/PKG-INFO
+[1.742s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop-0.0.1-py3.12.egg-info/dependency_links.txt
+[1.742s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop-0.0.1-py3.12.egg-info/top_level.txt
+[1.742s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop-0.0.1-py3.12.egg-info/SOURCES.txt
+[1.742s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop
+[1.742s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/__init__.py
+[1.742s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/mapper
+[1.742s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/mapper/__init__.py
+[1.742s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/mapper/motion_mapper.py
+[1.743s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/networking
+[1.743s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/networking/__init__.py
+[1.743s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/networking/natnet_node.py
+[1.743s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/ctrl
+[1.743s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/ctrl/__init__.py
+[1.743s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/ctrl/ctrl_interface.py
+[1.743s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/model
+[1.743s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/model/ModelV1.pth
+[1.743s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/model/train.py
+[1.744s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/model/__init__.py
+[1.744s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/model/gait_classifier.py
+[1.744s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/util
+[1.744s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/util/transforms.py
+[1.744s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/util/__init__.py
+[1.744s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/util/freq_meter.py
+[1.744s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/util/io_parser.py
+[1.744s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/util/performance_metrics.py
+[1.744s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/state
+[1.745s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/state/human.py
+[1.745s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/state/__init__.py
+[1.745s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/modes
+[1.745s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/modes/online_node.py
+[1.745s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/modes/__init__.py
+[1.745s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/modes/offline_node.py
+[1.745s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/teleop_node.py
+[1.815s] Listing '/home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop'...
+[1.815s] Compiling '/home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/__init__.py'...
+[1.815s] Listing '/home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/ctrl'...
+[1.815s] Compiling '/home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/ctrl/__init__.py'...
+[1.815s] Compiling '/home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/ctrl/ctrl_interface.py'...
+[1.815s] Listing '/home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/mapper'...
+[1.815s] Compiling '/home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/mapper/__init__.py'...
+[1.815s] Compiling '/home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/mapper/motion_mapper.py'...
+[1.815s] Listing '/home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/model'...
+[1.815s] Compiling '/home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/model/__init__.py'...
+[1.815s] Compiling '/home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/model/gait_classifier.py'...
+[1.815s] Compiling '/home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/model/train.py'...
+[1.816s] Listing '/home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/modes'...
+[1.816s] Compiling '/home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/modes/__init__.py'...
+[1.816s] Compiling '/home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/modes/offline_node.py'...
+[1.816s] Compiling '/home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/modes/online_node.py'...
+[1.816s] Listing '/home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/networking'...
+[1.816s] Compiling '/home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/networking/__init__.py'...
+[1.816s] Compiling '/home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/networking/natnet_node.py'...
+[1.816s] Listing '/home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/state'...
+[1.816s] Compiling '/home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/state/__init__.py'...
+[1.816s] Compiling '/home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/state/human.py'...
+[1.816s] Compiling '/home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/teleop_node.py'...
+[1.816s] Listing '/home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/util'...
+[1.817s] Compiling '/home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/util/__init__.py'...
+[1.817s] Compiling '/home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/util/freq_meter.py'...
+[1.817s] Compiling '/home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/util/io_parser.py'...
+[1.817s] Compiling '/home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/util/performance_metrics.py'...
+[1.817s] Compiling '/home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/python3.12/site-packages/mocap_teleop/util/transforms.py'...
+[1.821s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/mocap_teleop/online_node.py
+[1.821s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/mocap_teleop/teleop_node.py
+[1.821s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/lib/mocap_teleop/offline_node.py
+[1.822s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/share/mocap_teleop/launch
+[1.822s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/share/mocap_teleop/launch/teleop_offline.launch.py
+[1.822s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/share/mocap_teleop/launch/teleop_online.launch.py
+[1.822s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/share/mocap_teleop/config
+[1.822s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/share/mocap_teleop/config/config.toml
+[1.822s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/share/ament_index/resource_index/package_run_dependencies/mocap_teleop
+[1.823s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/share/ament_index/resource_index/parent_prefix_path/mocap_teleop
+[1.823s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/share/mocap_teleop/environment/ament_prefix_path.sh
+[1.823s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/share/mocap_teleop/environment/ament_prefix_path.dsv
+[1.823s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/share/mocap_teleop/environment/path.sh
+[1.824s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/share/mocap_teleop/environment/path.dsv
+[1.824s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/share/mocap_teleop/local_setup.bash
+[1.824s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/share/mocap_teleop/local_setup.sh
+[1.824s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/share/mocap_teleop/local_setup.zsh
+[1.824s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/share/mocap_teleop/local_setup.dsv
+[1.824s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/share/mocap_teleop/package.dsv
+[1.825s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/share/ament_index/resource_index/packages/mocap_teleop
+[1.825s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/share/mocap_teleop/cmake/mocap_teleopConfig.cmake
+[1.825s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/share/mocap_teleop/cmake/mocap_teleopConfig-version.cmake
+[1.825s] -- Installing: /home/nwsutton/ros_ws/src/mocap_teleop/install/mocap_teleop/share/mocap_teleop/package.xml
+[1.830s] Invoked command in '/home/nwsutton/ros_ws/src/mocap_teleop/build/mocap_teleop' returned '0': CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}:/opt/ros/jazzy:/home/*your_unity_id*/*your_workspace_name*/install/csc495_003_p1_tfsexport DEBUGINFOD_URLS=https://debuginfod.fedoraproject.org/ PS1=\[\e[1m\]\u@\h\[\e[0m\][./\W]\[\e[1m\]\\$\[\e[0m\] /usr/bin/cmake --install /home/nwsutton/ros_ws/src/mocap_teleop/build/mocap_teleop

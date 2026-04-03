@@ -1,0 +1,11 @@
+/home/nwsutton/ros_ws/src/mocap_teleop/build/mocap_teleop/CMakeFiles/uninstall.dir
+/home/nwsutton/ros_ws/src/mocap_teleop/build/mocap_teleop/CMakeFiles/mocap_teleop_uninstall.dir
+/home/nwsutton/ros_ws/src/mocap_teleop/build/mocap_teleop/CMakeFiles/ament_cmake_python_copy_mocap_teleop.dir
+/home/nwsutton/ros_ws/src/mocap_teleop/build/mocap_teleop/CMakeFiles/ament_cmake_python_build_mocap_teleop_egg.dir
+/home/nwsutton/ros_ws/src/mocap_teleop/build/mocap_teleop/CMakeFiles/test.dir
+/home/nwsutton/ros_ws/src/mocap_teleop/build/mocap_teleop/CMakeFiles/edit_cache.dir
+/home/nwsutton/ros_ws/src/mocap_teleop/build/mocap_teleop/CMakeFiles/rebuild_cache.dir
+/home/nwsutton/ros_ws/src/mocap_teleop/build/mocap_teleop/CMakeFiles/list_install_components.dir
+/home/nwsutton/ros_ws/src/mocap_teleop/build/mocap_teleop/CMakeFiles/install.dir
+/home/nwsutton/ros_ws/src/mocap_teleop/build/mocap_teleop/CMakeFiles/install/local.dir
+/home/nwsutton/ros_ws/src/mocap_teleop/build/mocap_teleop/CMakeFiles/install/strip.dir
