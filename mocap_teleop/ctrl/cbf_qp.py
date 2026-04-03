@@ -43,15 +43,14 @@ Frame conventions:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Tuple, Optional
+from typing import List, Tuple
 
 import numpy as np
 import scipy.sparse as sp
 import osqp
 
 import torch
-import cvxpy as cp
-from cvxpylayers.torch import CvxpyLayer
+from qpth.qp import QPFunction
 
 
 # ── Go2 robot dimensions (with safety margin) ────────────────────────────────
@@ -144,7 +143,6 @@ class CBFQP:
         self.max_obstacles     = max_obstacles
         self.robot_half_length = robot_half_length
         self.robot_half_width  = robot_half_width
-        self._layer: Optional[CvxpyLayer] = None   # built lazily
 
     # ── Fast backend (OSQP) ───────────────────────────────────────────────────
 
@@ -218,101 +216,88 @@ class CBFQP:
 
         return world_to_body(u_world, yaw)
 
-    # ── Differentiable backend (cvxpylayers) ──────────────────────────────────
+    # ── Differentiable backend (qpth) ────────────────────────────────────────
 
-    def _get_layer(self) -> CvxpyLayer:
-        """Build (once) the differentiable QP layer for max_obstacles.
-
-        Includes a scalar slack variable δ (paper eq. 11) that relaxes the
-        CBF constraints when they are mutually infeasible.  A large penalty ζ
-        keeps δ ≈ 0 at optimum so the constraints are effectively enforced,
-        while still ensuring the QP always has a feasible solution and
-        gradients always flow back to the α-net during training.
-        """
-        if self._layer is not None:
-            return self._layer
-
-        _ZETA = 1e2   # slack penalty — large enough that δ ≈ 0 at optimum
-
-        n            = self.max_obstacles
-        u            = cp.Variable(2)
-        delta        = cp.Variable(nonneg=True)   # scalar slack ≥ 0
-        u_perf_param = cp.Parameter(2)
-        A_param      = cp.Parameter((n, 2))       # CBF constraint normals
-        b_param      = cp.Parameter(n)            # lower bounds (= −α_i, padded)
-
-        prob = cp.Problem(
-            cp.Minimize(cp.sum_squares(u - u_perf_param) + _ZETA * cp.square(delta)),
-            [
-                A_param @ u >= b_param - delta,   # relaxed CBF constraints
-                u <=  self.v_max,
-                u >= -self.v_max,
-            ],
-        )
-        assert prob.is_dpp(), "QP must be DPP for cvxpylayers"
-
-        self._layer = CvxpyLayer(
-            prob,
-            parameters=[u_perf_param, A_param, b_param],
-            variables=[u, delta],
-        )
-        return self._layer
-
-    def solve_differentiable(
+    def solve_differentiable_batch(
         self,
-        u_perf_body_t: torch.Tensor,
-        obstacles:     List[Obstacle],
-        p_robot_t:     torch.Tensor,
-        yaw:           float,
-        alphas_t:      torch.Tensor,
+        u_perf_world_t: torch.Tensor,
+        A_cbf_t:        torch.Tensor,
+        b_cbf_t:        torch.Tensor,
     ) -> torch.Tensor:
         """
-        Solve the CBF-QP with cvxpylayers.  Use during offline training only.
+        Batched differentiable CBF-QP using qpth.  Use during offline training.
 
-        Obstacles beyond max_obstacles are ignored.  Fewer than max_obstacles
-        are padded with inactive constraints (a = 0, b = −1e6).
+        All inputs and outputs are in the world frame.  The caller is
+        responsible for rotating u_perf into world frame before calling and
+        rotating the result back to body frame afterwards.
+
+        QP solved per batch element:
+          min  ‖u − u_perf‖²
+           u
+          s.t.  A_cbf_i · u ≥ b_cbf_i    (CBF constraints, one row per obstacle)
+                −v_max ≤ u_j ≤ v_max      (box)
+
+        qpth uses the convention  G·u ≤ h, so CBF rows are negated.
+        A slack variable δ is added as a third optimisation variable so the
+        QP is always feasible — exactly as in the paper (eq. 11).  δ is
+        penalised with _ZETA so it stays near zero at optimum.
 
         Parameters
         ----------
-        u_perf_body_t : (2,)              nominal velocity, body frame
-        obstacles     : list of Obstacle  (world frame, numpy)
-        p_robot_t     : (2,)              robot position, world frame (tensor)
-        yaw           : float             robot heading (rad) — treated as constant
-        alphas_t      : (max_obstacles,)  α values from AlphaNet, padded if needed
+        u_perf_world_t : (B, 2)        nominal velocity, world frame
+        A_cbf_t        : (B, n_obs, 2) CBF constraint normals  ∂h/∂x
+        b_cbf_t        : (B, n_obs)    lower bounds = −α_i
 
         Returns
         -------
-        u_safe_body_t : (2,)  safe velocity in body frame — differentiable w.r.t. alphas_t
+        u_safe_world : (B, 2)  differentiable w.r.t. b_cbf_t (→ α-net weights)
         """
-        # Rotation matrix (constant — yaw not differentiated)
-        c, s = np.cos(yaw), np.sin(yaw)
-        R = torch.tensor([[c, -s], [s, c]], dtype=torch.float32)
+        from qpth.qp import QPFunction
 
-        u_perf_world = R @ u_perf_body_t   # (2,)
+        _ZETA = 1e2   # slack penalty: large enough δ≈0, small enough QP is well-scaled
 
-        n = self.max_obstacles
-        A_rows: List[torch.Tensor] = []
-        b_vals: List[torch.Tensor] = []
+        B     = u_perf_world_t.shape[0]
+        n_obs = A_cbf_t.shape[1]
+        dev   = u_perf_world_t.device
 
-        for i in range(n):
-            if i < len(obstacles):
-                obs   = obstacles[i]
-                p_obs = torch.tensor(obs.center, dtype=torch.float32)
-                # Elliptical CBF gradient: 2·Q(yaw,r)·(p_robot − p_obs)
-                Q_np  = ellipse_Q(yaw, obs.radius,
-                                  self.robot_half_length, self.robot_half_width)
-                Q_t   = torch.tensor(Q_np, dtype=torch.float32)
-                grad  = 2.0 * Q_t @ (p_robot_t - p_obs)   # (2,)
-                A_rows.append(grad)
-                b_vals.append(-alphas_t[i])
-            else:
-                # Inactive: constraint is always satisfied
-                A_rows.append(torch.zeros(2))
-                b_vals.append(torch.tensor(-1e6))
+        # ── Optimisation variable: [u (2), δ (1)] ────────────────────────────
+        # Cost: ‖u − u_perf‖² + ζ·δ² = uᵀu − 2·u_perfᵀu + ζ·δ²
+        # In [u; δ] coords: Q_aug = diag(2I, 2ζ), p_aug = [-2·u_perf; 0]
+        Q_aug = torch.zeros(B, 3, 3, device=dev)
+        Q_aug[:, 0, 0] = 2.0
+        Q_aug[:, 1, 1] = 2.0
+        Q_aug[:, 2, 2] = 2.0 * _ZETA
+        # Small regularisation for numerical stability
+        Q_aug = Q_aug + 1e-6 * torch.eye(3, device=dev).unsqueeze(0)
 
-        A_t = torch.stack(A_rows)   # (n, 2)
-        b_t = torch.stack(b_vals)   # (n,)
+        p_aug = torch.zeros(B, 3, device=dev)
+        p_aug[:, :2] = -2.0 * u_perf_world_t
 
-        (u_world, _delta) = self._get_layer()(u_perf_world, A_t, b_t)
+        # ── Inequality constraints G·[u;δ] ≤ h ───────────────────────────────
+        # CBF (relaxed): −A_cbf·u + (−1)·δ ≤ −b_cbf   [n_obs rows]
+        # Box:           ±I·u + 0·δ ≤ v_max            [4 rows]
+        # δ ≥ 0:         0·u − δ ≤ 0                   [1 row]
+        G_cbf  = torch.zeros(B, n_obs, 3, device=dev)
+        G_cbf[:, :, :2] = -A_cbf_t                    # −A_cbf on u
+        G_cbf[:, :,  2] = -1.0                        # −δ (relaxation)
+        h_cbf  = -b_cbf_t                             # (B, n_obs)
 
-        return R.T @ u_world.to(R.dtype)   # transform back to body frame
+        I2     = torch.eye(2, device=dev).unsqueeze(0).expand(B, -1, -1)
+        G_box  = torch.zeros(B, 4, 3, device=dev)
+        G_box[:, :2, :2] =  I2
+        G_box[:, 2:, :2] = -I2
+        h_box  = torch.full((B, 4), self.v_max, device=dev)
+
+        G_slack       = torch.zeros(B, 1, 3, device=dev)
+        G_slack[:, 0, 2] = -1.0                       # −δ ≤ 0  (δ ≥ 0)
+        h_slack        = torch.zeros(B, 1, device=dev)
+
+        G = torch.cat([G_cbf, G_box, G_slack], dim=1)   # (B, n_obs+5, 3)
+        h = torch.cat([h_cbf, h_box, h_slack], dim=1)   # (B, n_obs+5)
+
+        # Empty equality constraints
+        A_eq = torch.zeros(B, 0, 3, device=dev)
+        b_eq = torch.zeros(B, 0,    device=dev)
+
+        sol = QPFunction(verbose=False)(Q_aug, p_aug, G, h, A_eq, b_eq)  # (B, 3)
+        return sol[:, :2]   # discard δ, return u in world frame

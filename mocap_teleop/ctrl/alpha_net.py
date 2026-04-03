@@ -27,6 +27,7 @@ INPUT_DIM = 10
 
 
 class AlphaNet(nn.Module):
+    INPUT_DIM = INPUT_DIM   # expose as class attribute for external reshaping
     """Two-hidden-layer MLP outputting α > 0 for a single obstacle."""
 
     def __init__(self, hidden_dim: int = 64, eps: float = 1e-3):
@@ -49,8 +50,10 @@ class AlphaNet(nn.Module):
         # This makes the CBF maximally conservative at the start of training —
         # the constraint is always tight, so gradients always flow through the QP.
         # The network then learns to increase α where it is safe to do so.
-        nn.init.zeros_(self.net[-1].weight)
-        nn.init.zeros_(self.net[-1].bias)
+        last = self.net[-1]
+        assert isinstance(last, nn.Linear)
+        nn.init.zeros_(last.weight)
+        nn.init.zeros_(last.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
