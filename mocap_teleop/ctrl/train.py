@@ -54,7 +54,7 @@ _T              = 100     # rollout length (steps)
 _DT             = 0.05    # simulation timestep (s)  →  5 s per episode
 _N_ITERS        = 150     # training iterations
 _N_ENVS         = 30      # environments sampled per iteration
-_LR             = 1e-3    # Adam learning rate
+_LR             = 3e-4    # Adam learning rate
 _SLACK_WEIGHT   = 100.0   # λ_δ — penalty for CBF constraint violations
 _CHECKPOINT_DIR = '.'     # directory to save checkpoints
 
@@ -217,6 +217,8 @@ def train(
     alpha_net = AlphaNet(hidden_dim=64).to(device)
     cbf_qp    = CBFQP(v_max=1.5, max_obstacles=_MAX_OBSTACLES)
     optimizer = torch.optim.Adam(alpha_net.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=n_iters, eta_min=lr * 0.01)
 
     os.makedirs(checkpoint_dir, exist_ok=True)
 
@@ -231,13 +233,16 @@ def train(
         episodes  = [sample_episode(n_obstacles=n_obstacles) for _ in range(n_envs)]
         mean_loss = _rollout_batch(alpha_net, cbf_qp, episodes, device)
         mean_loss.backward()
+        torch.nn.utils.clip_grad_norm_(alpha_net.parameters(), max_norm=1.0)
         optimizer.step()
+        scheduler.step()
 
         # ── Logging ───────────────────────────────────────────────────────
         if it % 10 == 0 or it == n_iters - 1:
-            min_h = _eval_min_cbf(alpha_net, cbf_qp, n_eval=20,
+            min_h = _eval_min_cbf(alpha_net, cbf_qp, n_eval=50,
                                   n_obstacles=n_obstacles, device=device)
-            print(f"{it:>6}  {mean_loss.item():>12.3f}  {min_h:>16.4f}")
+            print(f"{it:>6}  {mean_loss.item():>12.3f}  {min_h:>16.4f}"
+                  f"   lr={scheduler.get_last_lr()[0]:.2e}")
 
         # ── Checkpoint ────────────────────────────────────────────────────
         if (it + 1) % 50 == 0:
