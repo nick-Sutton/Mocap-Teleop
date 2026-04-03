@@ -182,20 +182,23 @@ class CBFQP:
         # Box rows:  −v_max ≤ u_j ≤ v_max
         n = len(obstacles)
         if n > 0:
-            A_cbf = np.vstack([
+            grads = np.vstack([
                 cbf_gradient(p_robot, obs.center, yaw, obs.radius,
                              self.robot_half_length, self.robot_half_width)
                 for obs in obstacles
             ])                                          # (n, 2)
             # Standard class K CBF: ∂h/∂x · u ≥ −α · h(x)
-            # RHS = −α·h(x), clamped so we never require ḣ < 0 when already safe
             h_vals = np.array([
                 cbf_value(p_robot, obs.center, yaw, obs.radius,
                           self.robot_half_length, self.robot_half_width)
                 for obs in obstacles
             ])
-            l_cbf = np.array([-a * max(h, 0.0)
-                               for a, h in zip(alphas, h_vals)])  # (n,)
+            rhs = np.array([-a * max(h, 0.0)
+                             for a, h in zip(alphas, h_vals)])    # (n,)
+            # Normalise rows for consistent conditioning with training
+            norms = np.linalg.norm(grads, axis=1, keepdims=True).clip(min=1e-6)
+            A_cbf = grads / norms
+            l_cbf = rhs   / norms.squeeze()                       # (n,)
 
             A_full = sp.csc_matrix(np.vstack([A_cbf, np.eye(2)]))
             l_full = np.concatenate([l_cbf,          [-self.v_max, -self.v_max]])
@@ -267,17 +270,24 @@ class CBFQP:
         dev   = u_perf_world_t.device
 
         # ── Optimisation variable: u ∈ ℝ² ────────────────────────────────────
-        # No slack needed: u=0 always satisfies A_cbf·u = 0 ≥ −α (since α > 0)
-        # Cost: ‖u − u_perf‖² → Q = 2I (qpth uses ½uᵀQu), p = −2·u_perf
+        # Cost: ‖u − u_perf‖² → Q = 2I (qpth uses ½uᵀQu + pᵀu), p = −2·u_perf
+        # Regularisation 1e-4 (not 1e-6) for better numerical conditioning.
         Q = (2.0 * torch.eye(2, device=dev)
-             + 1e-6 * torch.eye(2, device=dev)).unsqueeze(0).expand(B, -1, -1)
+             + 1e-4 * torch.eye(2, device=dev)).unsqueeze(0).expand(B, -1, -1)
         p = -2.0 * u_perf_world_t                             # (B, 2)
 
+        # ── Normalise CBF constraint rows for numerical conditioning ──────────
+        # g·u ≥ b  ⟺  (g/‖g‖)·u ≥ b/‖g‖  — same feasible set, unit-norm rows
+        # prevents qpth from seeing rows with wildly different magnitudes.
+        grad_norm = A_cbf_t.norm(dim=-1, keepdim=True).clamp(min=1e-6)  # (B,n,1)
+        A_cbf_n   = A_cbf_t / grad_norm                                  # (B,n,2)
+        b_cbf_n   = b_cbf_t / grad_norm.squeeze(-1)                      # (B,n)
+
         # ── Inequality constraints G·u ≤ h ────────────────────────────────────
-        # CBF:  −A_cbf·u ≤ alphas    [n_obs rows]  (= A_cbf·u ≥ −alphas = b_cbf)
-        # Box:   ±I·u   ≤ v_max      [4 rows]
-        G_cbf = -A_cbf_t                                      # (B, n_obs, 2)
-        h_cbf = -b_cbf_t                                      # (B, n_obs)  = alphas
+        # CBF:  −A_cbf_n·u ≤ −b_cbf_n  (= A_cbf_n·u ≥ b_cbf_n)
+        # Box:   ±I·u      ≤  v_max
+        G_cbf = -A_cbf_n                                      # (B, n_obs, 2)
+        h_cbf = -b_cbf_n                                      # (B, n_obs)
 
         I2    = torch.eye(2, device=dev).unsqueeze(0).expand(B, -1, -1)
         G_box = torch.cat([ I2, -I2], dim=1)                  # (B, 4, 2)
