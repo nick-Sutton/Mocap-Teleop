@@ -87,17 +87,26 @@ def world_to_body(v_world: np.ndarray, yaw: float) -> np.ndarray:
 
 # ── Elliptical CBF helpers ────────────────────────────────────────────────────
 
-def ellipse_Q(yaw: float, r: float,
+def ellipse_Q(_yaw: float, r: float,
               a: float = ROBOT_HALF_LENGTH,
-              b: float = ROBOT_HALF_WIDTH) -> np.ndarray:
+              _b: float = ROBOT_HALF_WIDTH) -> np.ndarray:
     """
-    Shape matrix Q for the combined robot-ellipse + obstacle-circle barrier.
+    Shape matrix Q — yaw-independent circular approximation.
 
-    Q(yaw, r) = R(yaw) · diag(1/(a+r)², 1/(b+r)²) · R(yaw)ᵀ
+    Q = I / (a+r)²   →   h = |pos−center|² / (a+r)² − 1
+
+    Using the robot's maximum semi-axis (a, the forward length) as the uniform
+    clearance radius gives a conservative safe set that holds for any heading.
+
+    The previous elliptical formulation Q = R(yaw)·diag(1/(a+r)², 1/(b+r)²)·R(yaw)ᵀ
+    caused h to change as the robot turned (always facing the goal), because
+    ḣ = ∂h/∂pos·u + ∂h/∂yaw·ẏaw.  The CBF-QP only controls the first term;
+    the uncontrolled heading-rate term was pushing h negative during navigation
+    even with a maximally conservative α ≈ 0.  The circular Q eliminates the
+    yaw term entirely (∂h/∂yaw = 0).
     """
-    R  = _R(yaw)
-    La = np.diag([1.0 / (a + r) ** 2, 1.0 / (b + r) ** 2])
-    return R @ La @ R.T
+    R_sq = (a + r) ** 2
+    return np.eye(2) / R_sq
 
 
 def cbf_value(p_robot: np.ndarray, p_obs: np.ndarray,
@@ -266,29 +275,24 @@ class CBFQP:
         n_obs = A_cbf_t.shape[1]
         dev   = u_perf_world_t.device
 
-        # ── Softplus-smoothed CBF correction ─────────────────────────────────
+        # ── Exact halfspace projection (Dykstra, one pass per constraint) ───────
         #
-        # Hard projection (Dykstra/qpth) gives zero gradient when constraints
-        # are inactive — the α-net never gets a training signal when the robot
-        # is far from an obstacle, so it can't learn from scratch.
+        # Each iteration projects u onto the halfspace {u : a_i·u ≥ b_i}.
+        # For a single obstacle this is exact in one pass.  For multiple
+        # obstacles the alternating-projection sequence converges (Dykstra),
+        # though one pass is a reasonable approximation.
         #
-        # Instead we use a smooth approximation:
+        # relu(b − a·u) is the exact violation; zero when the constraint is
+        # already satisfied, positive when violated.  When zero, no correction
+        # is applied and no gradient flows through the QP step — which is
+        # correct.  The gradient still reaches α-net via the trajectory:
+        # h_now is in the computation graph (fix-1), so positions accumulated
+        # from active-constraint steps carry gradient signal to later steps
+        # even when those later steps are constraint-inactive.
         #
-        #   violation_i = softplus(b_i − a_i·u_perf, β)
-        #                ≈ max(0, b_i − a_i·u_perf)   but smooth everywhere
-        #
-        #   u_safe = u_perf + Σ_i (violation_i / ‖a_i‖²) · a_i
-        #          = u_perf + total correction toward satisfying all CBF constraints
-        #
-        # softplus has non-zero gradient everywhere → α-net always receives a
-        # training signal through b_i = −α·h(x) regardless of constraint status.
-        # At deployment we use OSQP (exact) so this approximation only affects
-        # training.
-        #
-        # β controls sharpness: high β → closer to exact hard projection,
-        # lower β → smoother gradients (better for early training).
-
-        _BETA = 5.0
+        # Crucially, this makes the training solver identical to OSQP for the
+        # single-obstacle case, eliminating the train/eval mismatch that made
+        # the softplus approach fail.
 
         n_cbf = A_cbf_t.shape[1]
         u     = u_perf_world_t.clone()   # (B, 2)
@@ -298,9 +302,7 @@ class CBFQP:
             b    = b_cbf_t[:, i]                             # (B,)
             dot  = (a * u).sum(-1)                           # (B,)
             a_sq = (a * a).sum(-1).clamp(min=1e-8)           # (B,)
-            # Smooth violation — non-zero even when constraint is satisfied
-            viol = torch.nn.functional.softplus(b - dot, beta=_BETA)  # (B,)
-            # Correct u toward constraint satisfaction
+            viol = torch.nn.functional.relu(b - dot)         # (B,)  exact violation
             u    = u + (viol / a_sq).unsqueeze(-1) * a
 
         # Box constraint — hard clip is fine, α-net doesn't depend on v_max

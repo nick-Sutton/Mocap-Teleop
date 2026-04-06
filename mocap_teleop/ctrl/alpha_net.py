@@ -8,13 +8,17 @@ controls how aggressively the CBF-QP pushes the robot away from each
 obstacle.  A larger α allows the robot to get closer before the safety
 constraint activates; a smaller α is more conservative.
 
-Input (per obstacle, 10-D):
-    [p_obs_x, p_obs_y,      obstacle centre  (world frame, m)
-     r,                     obstacle radius   (m)
-     p_robot_x, p_robot_y,  robot position    (world frame, m)
-     yaw_robot,             robot heading     (rad)
-     x0_x, x0_y,           robot position at episode start (world frame, m)
-     vx_perf, vy_perf]      nominal (mocap) velocity command (m/s)
+All features are expressed relative to the robot body frame so the network
+generalises across arbitrary world positions and headings — absolute world
+coordinates would cause the network to memorise obstacle locations in the
+training arena rather than learning the geometry of avoidance.
+
+Input (per obstacle, 8-D):
+    [d_obs_x, d_obs_y,      obstacle centre relative to robot, body frame (m)
+     r,                     obstacle radius  (m)
+     h,                     current CBF value h(x) = |d|²/(a+r)² − 1
+     vx_perf, vy_perf,      nominal (mocap) velocity command, body frame (m/s)
+     g_x, g_y]              goal relative to robot, body frame (m)
 
 Output (per obstacle, scalar):
     α > 0   enforced by ReLU + ε offset
@@ -23,7 +27,7 @@ Output (per obstacle, scalar):
 import torch
 import torch.nn as nn
 
-INPUT_DIM = 10
+INPUT_DIM = 8
 
 
 class AlphaNet(nn.Module):
@@ -46,14 +50,21 @@ class AlphaNet(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, 1),
         )
-        # Start output near zero so α ≈ ε initially.
-        # This makes the CBF maximally conservative at the start of training —
-        # the constraint is always tight, so gradients always flow through the QP.
-        # The network then learns to increase α where it is safe to do so.
+        # Initialise to α ≈ 1.0 with small input-dependent variation.
+        #
+        # The previous zeros_(weight) + zeros_(bias) initialisation caused a
+        # permanent dead-relu: net(x) = 0 → relu(0) = 0, relu'(0) = 0 →
+        # every gradient was multiplied by zero → no parameter ever updated.
+        #
+        # With bias = 1.0 and small weight: net(x) ≈ 1 + tiny_variation,
+        # relu'(net) = 1, gradients flow through all layers from step 1.
+        # α ≈ 1.0 is a reasonable starting point — the CBF allows moderate
+        # approach, so the performance loss has a meaningful gradient w.r.t. α,
+        # and the safety penalty keeps h from going negative.
         last = self.net[-1]
         assert isinstance(last, nn.Linear)
-        nn.init.zeros_(last.weight)
-        nn.init.zeros_(last.bias)
+        nn.init.normal_(last.weight, std=0.01)
+        nn.init.constant_(last.bias, 1.0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -69,33 +80,31 @@ class AlphaNet(nn.Module):
 
     @staticmethod
     def build_input(
-        p_obs:    torch.Tensor,
-        r:        torch.Tensor,
-        p_robot:  torch.Tensor,
-        yaw:      torch.Tensor,
-        x0:       torch.Tensor,
-        u_perf:   torch.Tensor,
+        d_to_obs_body: torch.Tensor,
+        r:             torch.Tensor,
+        h:             torch.Tensor,
+        u_perf:        torch.Tensor,
+        d_to_goal:     torch.Tensor,
     ) -> torch.Tensor:
         """
-        Convenience helper: concatenate features into the 10-D input vector.
+        Convenience helper: concatenate features into the 8-D input vector.
 
         All arguments may be batched along an arbitrary leading batch dimension
         as long as shapes are broadcast-compatible.
 
         Parameters
         ----------
-        p_obs   : (..., 2)  obstacle centre in world frame (x, y)
-        r       : (..., 1)  obstacle radius
-        p_robot : (..., 2)  robot position in world frame (x, y)
-        yaw     : (..., 1)  robot heading (rad)
-        x0      : (..., 2)  robot position at episode start (x, y)
-        u_perf  : (..., 2)  nominal velocity command (vx, vy) in body frame
+        d_to_obs_body : (..., 2)  obstacle centre relative to robot, in body frame
+        r             : (..., 1)  obstacle radius (m)
+        h             : (..., 1)  current CBF value h(x) = |d|²/(a+r)² − 1
+        u_perf        : (..., 2)  nominal velocity (vx, vy) in body frame (m/s)
+        d_to_goal     : (..., 2)  goal relative to robot, in body frame (m)
 
         Returns
         -------
         features : (..., INPUT_DIM)
         """
-        return torch.cat([p_obs, r, p_robot, yaw, x0, u_perf], dim=-1)
+        return torch.cat([d_to_obs_body, r, h, u_perf, d_to_goal], dim=-1)
 
     def save(self, path: str) -> None:
         torch.save(self.state_dict(), path)

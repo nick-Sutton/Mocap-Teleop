@@ -85,7 +85,6 @@ def _rollout_batch(
     # ── Pre-extract episode data onto device ──────────────────────────────
     pos    = torch.tensor(
         np.stack([ep.start for ep in episodes]), dtype=torch.float32, device=device)
-    x0     = pos.clone()                                              # (B, 2)
     goals  = torch.tensor(
         np.stack([ep.goal  for ep in episodes]), dtype=torch.float32, device=device)
 
@@ -129,18 +128,21 @@ def _rollout_batch(
         u_perf_body_t = torch.einsum(
             'bij,bj->bi', R_t.transpose(1, 2), u_perf_world_t)   # (B, 2)
 
-        # ── Elliptical CBF gradient A_cbf: (B, n_obs, 2) ─────────────────
-        # Q(yaw, r) = R·diag(1/(a+r)², 1/(b+r)²)·Rᵀ  per (env, obstacle)
+        # ── Circular CBF gradient A_cbf: (B, n_obs, 2) ──────────────────
+        # Q = I/(a+r)²  →  h = |d|²/(a+r)² − 1  (yaw-independent)
+        #
+        # The previous yaw-dependent Q = R·diag(1/(a+r)², 1/(b+r)²)·Rᵀ caused
+        # h to change as the robot turned (∂h/∂yaw ≠ 0), and that heading-rate
+        # term is not controlled by the QP.  With circular Q the rotation R
+        # cancels (R·(la·I)·Rᵀ = la·I), so h depends only on |d|² and the
+        # CBF constraint fully controls ḣ.
         r_np   = radii.detach().cpu().numpy()                     # (B, n_obs)
-        a, b_  = ROBOT_HALF_LENGTH, ROBOT_HALF_WIDTH
-        la     = 1.0 / (a  + r_np) ** 2                          # (B, n_obs)
-        lb     = 1.0 / (b_ + r_np) ** 2
-        # Expand R for each obstacle: (B, 1, 2, 2) → broadcast (B, n_obs, 2, 2)
-        R_exp  = R_np[:, np.newaxis, :, :]                        # (B,1,2,2)
-        Lambda = np.zeros((*r_np.shape, 2, 2))                    # (B,n_obs,2,2)
-        Lambda[..., 0, 0] = la
-        Lambda[..., 1, 1] = lb
-        Q_np   = R_exp @ Lambda @ R_exp.transpose(0, 1, 3, 2)    # (B,n_obs,2,2)
+        a      = ROBOT_HALF_LENGTH
+        la     = 1.0 / (a + r_np) ** 2                           # (B, n_obs)
+        # Q = la·I  (scalar per (batch, obstacle), broadcast over 2×2)
+        Q_np                = np.zeros((*r_np.shape, 2, 2))       # (B,n_obs,2,2)
+        Q_np[..., 0, 0]     = la
+        Q_np[..., 1, 1]     = la
 
         # d = pos − center: (B, n_obs, 2)
         d_obs_np = (pos_np[:, np.newaxis, :]
@@ -150,34 +152,63 @@ def _rollout_batch(
         A_cbf_t  = torch.tensor(A_cbf_np, dtype=torch.float32, device=device)
 
         # ── α-net: (B × n_obs) features in one forward pass ──────────────
-        # Build (B, n_obs, 10) feature tensor then reshape to (B*n_obs, 10)
-        p_robot_exp = pos.detach().unsqueeze(1).expand(-1, n_obs, -1)  # (B,n_obs,2)
-        yaw_exp     = torch.tensor(yaws, dtype=torch.float32,
-                                   device=device).unsqueeze(1).unsqueeze(2).expand(
-                                       -1, n_obs, 1)                   # (B,n_obs,1)
-        x0_exp      = x0.unsqueeze(1).expand(-1, n_obs, -1)            # (B,n_obs,2)
-        u_exp       = u_perf_body_t.unsqueeze(1).expand(-1, n_obs, -1) # (B,n_obs,2)
+        # All features are relative to the robot body frame so the network
+        # generalises across arbitrary world positions and headings.
+        #
+        # Features (8-D per obstacle):
+        #   d_to_obs_body : obstacle centre relative to robot, in body frame
+        #   r             : obstacle radius
+        #   h             : current CBF value (how close to safety boundary)
+        #   u_perf_body   : nominal velocity in body frame (direction of intent)
+        #   d_to_goal     : goal relative to robot, in body frame (navigation urgency)
+        #
+        # Using absolute world coords (p_obs, p_robot) would cause the network
+        # to memorise obstacle locations in the training arena instead of
+        # learning the geometry of avoidance — useless for deployment.
+
+        pos_det   = pos.detach()                                          # (B, 2)
+        # R^T: world → body; einsum 'bji,bnj->bni' transposes the 2×2 block
+        # d_to_obs in world frame: (B, n_obs, 2)
+        d_to_obs_w = centers - pos_det.unsqueeze(1)                       # (B, n_obs, 2)
+        # Rotate to body frame
+        d_to_obs_body_t = torch.einsum(
+            'bji,bnj->bni', R_t, d_to_obs_w)                             # (B, n_obs, 2)
+
+        # h for features from detached pos (constant input to network)
+        Q_t_now = torch.tensor(Q_np, dtype=torch.float32, device=device)
+        d_now_det = pos_det.unsqueeze(1) - centers                        # (B, n_obs, 2)
+        h_feat    = (torch.einsum('bni,bnij,bnj->bn', d_now_det, Q_t_now, d_now_det)
+                     - 1.0).unsqueeze(-1)                                 # (B, n_obs, 1)
+
+        # d_to_goal in body frame: (B, n_obs, 2)
+        d_to_goal_w   = goals.detach() - pos_det                          # (B, 2)
+        d_to_goal_b   = torch.einsum('bji,bj->bi', R_t, d_to_goal_w)     # (B, 2)
+        d_to_goal_exp = d_to_goal_b.unsqueeze(1).expand(-1, n_obs, -1)   # (B, n_obs, 2)
+
+        u_exp = u_perf_body_t.unsqueeze(1).expand(-1, n_obs, -1)          # (B, n_obs, 2)
 
         feat = AlphaNet.build_input(
-            p_obs   = centers,                     # (B, n_obs, 2)
-            r       = radii.unsqueeze(-1),         # (B, n_obs, 1)
-            p_robot = p_robot_exp,
-            yaw     = yaw_exp,
-            x0      = x0_exp,
-            u_perf  = u_exp,
-        ).reshape(B * n_obs, AlphaNet.INPUT_DIM if hasattr(AlphaNet, 'INPUT_DIM')
-                  else 10)
+            d_to_obs_body = d_to_obs_body_t,        # (B, n_obs, 2)
+            r             = radii.unsqueeze(-1),    # (B, n_obs, 1)
+            h             = h_feat,                 # (B, n_obs, 1)
+            u_perf        = u_exp,                  # (B, n_obs, 2)
+            d_to_goal     = d_to_goal_exp,          # (B, n_obs, 2)
+        ).reshape(B * n_obs, AlphaNet.INPUT_DIM)
 
         alphas_flat = alpha_net(feat).reshape(B, n_obs)   # (B, n_obs)
 
         # Standard CBF class K constraint: ∂h/∂x · u ≥ −α · h(x)
         # RHS scales with current barrier value so constraint tightens
         # as the robot approaches the obstacle boundary (h → 0).
-        Q_t_now = torch.tensor(Q_np, dtype=torch.float32, device=device)
-        d_now   = pos.detach().unsqueeze(1) - centers     # (B, n_obs, 2)
+        #
+        # h_now uses pos WITHOUT detach so gradient flows back through the
+        # trajectory: dL/dα includes the cumulative effect of α on future
+        # positions, not just the immediate QP correction.
+        # h for the QP RHS — NOT detached so gradient flows through trajectory
+        d_now   = pos.unsqueeze(1) - centers               # (B, n_obs, 2)  [no detach]
         h_now   = (torch.einsum('bni,bnij,bnj->bn', d_now, Q_t_now, d_now)
                    - 1.0)                                  # (B, n_obs)
-        b_cbf_t = -alphas_flat * h_now.clamp(min=0.0)     # (B, n_obs)
+        b_cbf_t = -alphas_flat * h_now                     # (B, n_obs)  [no clamp]
 
         # ── Batched differentiable CBF-QP ─────────────────────────────────
         u_safe_world = cbf_qp.solve_differentiable_batch(
@@ -190,12 +221,19 @@ def _rollout_batch(
         per_ep = torch.sum((pos - goals) ** 2, dim=1) / dist0_sq  # (B,)
         loss   = loss + torch.sum(per_ep)
 
-        # ── Soft CBF violation penalty (normalised) ────────────────────────
+        # ── Soft CBF violation penalty with safety margin (normalised) ───────
+        # relu(margin − h)² penalises h < margin, not just h < 0.
+        # This creates a gradient that pushes α DOWN before the robot reaches
+        # the physical boundary, giving a stable equilibrium at h ≈ margin
+        # rather than h ≈ 0.  Without this, the performance gradient drives α
+        # up until the robot reaches h = 0 exactly — which is unsafe in practice
+        # due to discrete-time integration error.
+        _H_MARGIN = 0.05
         Q_t    = torch.tensor(Q_np, dtype=torch.float32, device=device) # (B,n_obs,2,2)
         d_obs  = pos.unsqueeze(1) - centers                              # (B,n_obs,2)
         h_vals = torch.einsum('bni,bnij,bnj->bn', d_obs, Q_t, d_obs) - 1.0
         viol   = _SLACK_WEIGHT * torch.sum(
-            torch.relu(-h_vals) ** 2, dim=1) / dist0_sq               # (B,)
+            torch.relu(_H_MARGIN - h_vals) ** 2, dim=1) / dist0_sq    # (B,)
         loss   = loss + torch.sum(viol)
 
     return loss / B
@@ -204,12 +242,13 @@ def _rollout_batch(
 # ── Main training loop ────────────────────────────────────────────────────────
 
 def train(
-    n_iters:        int  = _N_ITERS,
-    n_envs:         int  = _N_ENVS,
-    n_obstacles:    int  = 1,
+    n_iters:        int   = _N_ITERS,
+    n_envs:         int   = _N_ENVS,
+    n_obstacles:    int   = 1,
     lr:             float = _LR,
-    checkpoint_dir: str  = _CHECKPOINT_DIR,
-    out_name:       str  = 'alpha_net.pth',
+    checkpoint_dir: str   = _CHECKPOINT_DIR,
+    out_name:       str   = 'alpha_net.pth',
+    resume:         str   = '',
 ) -> AlphaNet:
     """
     Train the α-net and return the trained model.
@@ -222,6 +261,9 @@ def train(
     lr             : Adam learning rate
     checkpoint_dir : directory for periodic checkpoints
     out_name       : filename for the final saved weights
+    resume         : path to a checkpoint to warm-restart from; the LR
+                     schedule is reset to its initial value so training
+                     continues with full step sizes from the loaded weights
     """
     assert n_obstacles <= _MAX_OBSTACLES, (
         f"n_obstacles={n_obstacles} exceeds _MAX_OBSTACLES={_MAX_OBSTACLES}. "
@@ -230,6 +272,10 @@ def train(
 
     device    = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     alpha_net = AlphaNet(hidden_dim=64).to(device)
+    if resume:
+        alpha_net.load(resume, device=str(device))
+        alpha_net.train()   # load() sets eval() — switch back for training
+        print(f"Resumed from {resume}  (LR schedule reset to {lr:.2e})")
     cbf_qp    = CBFQP(v_max=1.5, max_obstacles=_MAX_OBSTACLES)
     optimizer = torch.optim.Adam(alpha_net.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -248,7 +294,9 @@ def train(
         episodes  = [sample_episode(n_obstacles=n_obstacles) for _ in range(n_envs)]
         mean_loss = _rollout_batch(alpha_net, cbf_qp, episodes, device)
         mean_loss.backward()
-        torch.nn.utils.clip_grad_norm_(alpha_net.parameters(), max_norm=1.0)
+        # Raised from 1.0: full BPTT through h_now produces larger gradient
+        # norms; clipping too aggressively at 1.0 crushes the signal.
+        torch.nn.utils.clip_grad_norm_(alpha_net.parameters(), max_norm=5.0)
         optimizer.step()
         scheduler.step()
 
@@ -295,25 +343,35 @@ def _eval_min_cbf(
     for _ in range(n_eval):
         episode = sample_episode(n_obstacles=n_obstacles)
         sim.reset(episode.start)
-        x0 = episode.start.copy()
 
         for _ in range(_T):
             pos_np  = sim.pos
             yaw     = sim.heading_toward(episode.goal)
             sim.yaw = yaw
 
+            c, s = np.cos(yaw), np.sin(yaw)
+            R = np.array([[c, -s], [s, c]])   # body → world; R^T is world → body
+
             u_perf_np = pd_eval(pos_np, episode.goal, yaw)
             u_perf_t  = torch.tensor(u_perf_np, dtype=torch.float32, device=device)
 
+            # d_to_goal in body frame — same for all obstacles this step
+            d_to_goal_body = torch.tensor(
+                R.T @ (episode.goal - pos_np), dtype=torch.float32, device=device)
+
             alphas: List[float] = []
             for obs in episode.obstacles:
+                a_half = ROBOT_HALF_LENGTH
+                d_w    = obs.center - pos_np                               # world frame
+                d_to_obs_body = R.T @ d_w                                  # body frame
+                h_val  = float(np.dot(d_w, d_w) / (a_half + obs.radius)**2 - 1.0)
+
                 feat = AlphaNet.build_input(
-                    p_obs   = torch.tensor(obs.center,   dtype=torch.float32, device=device),
-                    r       = torch.tensor([obs.radius], dtype=torch.float32, device=device),
-                    p_robot = torch.tensor(pos_np,       dtype=torch.float32, device=device),
-                    yaw     = torch.tensor([yaw],        dtype=torch.float32, device=device),
-                    x0      = torch.tensor(x0,           dtype=torch.float32, device=device),
-                    u_perf  = u_perf_t,
+                    d_to_obs_body = torch.tensor(d_to_obs_body, dtype=torch.float32, device=device),
+                    r             = torch.tensor([obs.radius],  dtype=torch.float32, device=device),
+                    h             = torch.tensor([h_val],       dtype=torch.float32, device=device),
+                    u_perf        = u_perf_t,
+                    d_to_goal     = d_to_goal_body,
                 )
                 alphas.append(float(alpha_net(feat).cpu().item()))
 
@@ -342,6 +400,8 @@ def main():
     parser.add_argument('--lr',         type=float, default=_LR)
     parser.add_argument('--out',        type=str,   default='alpha_net.pth')
     parser.add_argument('--ckpt-dir',   type=str,   default=_CHECKPOINT_DIR)
+    parser.add_argument('--resume',     type=str,   default='',
+                        help='path to checkpoint for warm restart (weights loaded, LR reset)')
     args = parser.parse_args()
 
     train(
@@ -351,6 +411,7 @@ def main():
         lr             = args.lr,
         checkpoint_dir = args.ckpt_dir,
         out_name       = args.out,
+        resume         = args.resume,
     )
 
 
