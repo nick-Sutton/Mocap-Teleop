@@ -390,29 +390,160 @@ def _eval_min_cbf(
     return min_h
 
 
+# ── Baseline comparison ───────────────────────────────────────────────────────
+
+def evaluate(
+    model_path:  str,
+    n_eval:      int = 500,
+    n_obstacles: int = 1,
+) -> None:
+    """
+    Compare the learned α-net against fixed-α baselines.
+
+    Reports per-policy:
+      mean_loss  — average normalised trajectory cost (lower = faster to goal)
+      min_h      — minimum CBF value seen across all episodes (negative = collision)
+      coll_rate  — fraction of episodes with at least one h < 0 step
+      mean_alpha — average α the learned net outputs (for diagnosing aggression)
+    """
+    from mocap_teleop.ctrl.simulator import KinematicSim
+
+    device    = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    alpha_net = AlphaNet(hidden_dim=64).to(device)
+    alpha_net.load(model_path, device=str(device))
+
+    cbf_qp  = CBFQP(v_max=1.5, max_obstacles=_MAX_OBSTACLES)
+    pd_eval = PDController(kp=1.5, v_max=1.5)
+    sim     = KinematicSim(dt=_DT)
+
+    # Pre-sample episodes so every policy sees the same scenarios
+    episodes = [sample_episode(n_obstacles=n_obstacles) for _ in range(n_eval)]
+
+    def _run_policy(alpha_fn):
+        """alpha_fn(pos_np, yaw, R, obs, u_perf_t) → float"""
+        total_loss  = 0.0
+        global_min_h = float('inf')
+        n_collisions = 0
+        alpha_values = []
+
+        for ep in episodes:
+            sim.reset(ep.start)
+            dist0_sq = float(np.sum((ep.start - ep.goal) ** 2))
+            dist0_sq = max(dist0_sq, 1e-3)
+            ep_loss  = 0.0
+            ep_min_h = float('inf')
+
+            for _ in range(_T):
+                pos_np = sim.pos
+                yaw    = sim.heading_toward(ep.goal)
+                sim.yaw = yaw
+                c, s   = np.cos(yaw), np.sin(yaw)
+                R      = np.array([[c, -s], [s, c]])
+
+                u_perf_np = pd_eval(pos_np, ep.goal, yaw)
+                u_perf_t  = torch.tensor(u_perf_np, dtype=torch.float32, device=device)
+
+                alphas = []
+                for obs in ep.obstacles:
+                    a_val = alpha_fn(pos_np, yaw, R, obs, u_perf_t, ep.goal)
+                    alphas.append(a_val)
+                    alpha_values.append(a_val)
+
+                u_safe_np = cbf_qp.solve_fast(
+                    u_perf_body=u_perf_np, obstacles=ep.obstacles,
+                    p_robot=pos_np, yaw=yaw, alphas=alphas)
+                sim.step(u_safe_np)
+
+                ep_loss += float(np.sum((sim.pos - ep.goal) ** 2)) / dist0_sq
+                for obs in ep.obstacles:
+                    ep_min_h = min(ep_min_h, sim.cbf_value(obs))
+
+            total_loss   += ep_loss
+            global_min_h  = min(global_min_h, ep_min_h)
+            if ep_min_h < 0:
+                n_collisions += 1
+
+        mean_loss  = total_loss / n_eval
+        coll_rate  = n_collisions / n_eval
+        mean_alpha = float(np.mean(alpha_values)) if alpha_values else float('nan')
+        return mean_loss, global_min_h, coll_rate, mean_alpha
+
+    # ── Learned α ─────────────────────────────────────────────────────────────
+    @torch.no_grad()
+    def learned_alpha(pos_np, _yaw, R, obs, u_perf_t, goal):
+        d_w           = obs.center - pos_np
+        d_to_obs_body = R.T @ d_w
+        h_val         = float(np.dot(d_w, d_w) / (ROBOT_HALF_LENGTH + obs.radius)**2 - 1.0)
+        d_to_goal_b   = R.T @ (goal - pos_np)
+        feat = AlphaNet.build_input(
+            d_to_obs_body = torch.tensor(d_to_obs_body, dtype=torch.float32, device=device),
+            r             = torch.tensor([obs.radius],  dtype=torch.float32, device=device),
+            h             = torch.tensor([h_val],       dtype=torch.float32, device=device),
+            u_perf        = u_perf_t,
+            d_to_goal     = torch.tensor(d_to_goal_b,  dtype=torch.float32, device=device),
+        )
+        return float(alpha_net(feat).cpu().item())
+
+    print(f"\nEvaluating on {n_eval} episodes  (obstacles={n_obstacles})\n")
+    print(f"{'Policy':<18}  {'Mean loss':>10}  {'Min h':>8}  {'Coll%':>7}  {'Mean α':>8}")
+    print("-" * 58)
+
+    loss, min_h, coll, mean_a = _run_policy(learned_alpha)
+    print(f"{'learned α':<18}  {loss:>10.3f}  {min_h:>8.4f}  {coll*100:>6.1f}%  {mean_a:>8.3f}")
+
+    for fixed_a in [0.5, 1.0, 2.0, 5.0]:
+        def fixed_alpha(pos_np, yaw, R, obs, u_perf_t, goal, a=fixed_a):
+            return a
+        loss, min_h, coll, mean_a = _run_policy(fixed_alpha)
+        print(f"{'fixed α='+str(fixed_a):<18}  {loss:>10.3f}  {min_h:>8.4f}  {coll*100:>6.1f}%  {mean_a:>8.3f}")
+
+
 # ── CLI entry point ───────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description='Train the CBF α-net')
-    parser.add_argument('--iters',      type=int,   default=_N_ITERS)
-    parser.add_argument('--envs',       type=int,   default=_N_ENVS)
-    parser.add_argument('--obstacles',  type=int,   default=1)
-    parser.add_argument('--lr',         type=float, default=_LR)
-    parser.add_argument('--out',        type=str,   default='alpha_net.pth')
-    parser.add_argument('--ckpt-dir',   type=str,   default=_CHECKPOINT_DIR)
-    parser.add_argument('--resume',     type=str,   default='',
-                        help='path to checkpoint for warm restart (weights loaded, LR reset)')
+    parser = argparse.ArgumentParser(description='Train or evaluate the CBF α-net')
+    sub = parser.add_subparsers(dest='cmd')
+
+    # ── train subcommand (default behaviour) ──────────────────────────────────
+    tr = sub.add_parser('train', help='train the α-net (default)')
+    tr.add_argument('--iters',     type=int,   default=_N_ITERS)
+    tr.add_argument('--envs',      type=int,   default=_N_ENVS)
+    tr.add_argument('--obstacles', type=int,   default=1)
+    tr.add_argument('--lr',        type=float, default=_LR)
+    tr.add_argument('--out',       type=str,   default='alpha_net.pth')
+    tr.add_argument('--ckpt-dir',  type=str,   default=_CHECKPOINT_DIR)
+    tr.add_argument('--resume',    type=str,   default='',
+                    help='checkpoint for warm restart (weights loaded, LR reset)')
+
+    # ── eval subcommand ───────────────────────────────────────────────────────
+    ev = sub.add_parser('eval', help='compare learned α against fixed-α baselines')
+    ev.add_argument('model',       type=str,
+                    help='path to saved α-net checkpoint (e.g. alpha_net_v2.pth)')
+    ev.add_argument('--episodes',  type=int,   default=500)
+    ev.add_argument('--obstacles', type=int,   default=1)
+
+    # ── fallback: no subcommand → train with old-style flat args ─────────────
+    parser.add_argument('--iters',     type=int,   default=_N_ITERS)
+    parser.add_argument('--envs',      type=int,   default=_N_ENVS)
+    parser.add_argument('--obstacles', type=int,   default=1)
+    parser.add_argument('--lr',        type=float, default=_LR)
+    parser.add_argument('--out',       type=str,   default='alpha_net.pth')
+    parser.add_argument('--ckpt-dir',  type=str,   default=_CHECKPOINT_DIR)
+    parser.add_argument('--resume',    type=str,   default='')
     args = parser.parse_args()
 
-    train(
-        n_iters        = args.iters,
-        n_envs         = args.envs,
-        n_obstacles    = args.obstacles,
-        lr             = args.lr,
-        checkpoint_dir = args.ckpt_dir,
-        out_name       = args.out,
-        resume         = args.resume,
-    )
+    if args.cmd == 'eval':
+        evaluate(args.model, n_eval=args.episodes, n_obstacles=args.obstacles)
+    else:
+        train(
+            n_iters        = args.iters,
+            n_envs         = args.envs,
+            n_obstacles    = args.obstacles,
+            lr             = args.lr,
+            checkpoint_dir = args.ckpt_dir,
+            out_name       = args.out,
+            resume         = args.resume,
+        )
 
 
 if __name__ == '__main__':

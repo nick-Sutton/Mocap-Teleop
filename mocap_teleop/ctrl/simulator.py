@@ -129,6 +129,11 @@ def sample_episode(
     Obstacles are placed near the straight-line path from start to goal
     so the robot has to actively avoid them rather than going around.
 
+    For multi-obstacle episodes, obstacles are guaranteed not to mutually
+    overlap (with enough clearance for the robot to pass between any pair),
+    preventing infeasible CBF-QP configurations where constraints point in
+    irreconcilable directions.
+
     Parameters
     ----------
     n_obstacles  : number of circular obstacles
@@ -138,6 +143,14 @@ def sample_episode(
     min_sg_dist  : minimum required distance between start and goal (m)
     obs_spread   : std-dev of the lateral scatter around the straight-line path (m)
     """
+    # With multiple obstacles reduce max radius so they don't collectively
+    # block all corridors (3 × 0.8m obstacles can wall off a short path).
+    effective_max_r = max_r if n_obstacles == 1 else min(max_r, 0.5)
+
+    # Robot diameter — minimum gap we must leave between any two obstacles
+    # so the robot can physically fit through.
+    _ROBOT_DIAM  = 2.0 * ROBOT_HALF_LENGTH + 0.3   # add 0.3 m clearance
+
     # Rejection-sample start/goal pair with sufficient separation
     while True:
         start = np.random.uniform(-arena_half, arena_half, 2)
@@ -145,16 +158,18 @@ def sample_episode(
         if np.linalg.norm(goal - start) >= min_sg_dist:
             break
 
-    # Sample obstacles, rejection-sampling until start AND goal are both clear.
-    # This guarantees h(x_0) > 0, which is required for the CBF QP to have a
-    # meaningful gradient signal from the very first step.
+    # Sample obstacles, rejection-sampling until:
+    #   1. Start and goal are both clear of all obstacles.
+    #   2. No two obstacles overlap (robot can pass between every pair).
+    # This guarantees h(x_0) > 0 and the CBF-QP is never trivially infeasible
+    # due to conflicting constraint gradients from packed obstacles.
     _SAFE_MARGIN = 0.3   # metres — minimum h value required at start and goal
-    for _ in range(200):
+    for _ in range(500):
         obstacles = []
         for _ in range(n_obstacles):
-            t      = np.random.uniform(0.20, 0.80)   # keep obs away from endpoints
+            t      = np.random.uniform(0.20, 0.80)
             center = start + t * (goal - start) + np.random.randn(2) * obs_spread
-            radius = np.random.uniform(min_r, max_r)
+            radius = np.random.uniform(min_r, effective_max_r)
             obstacles.append(Obstacle(center=center, radius=radius))
 
         # Reject if robot starts or ends inside (or too close to) any obstacle
@@ -168,7 +183,20 @@ def sample_episode(
                        ROBOT_HALF_LENGTH, ROBOT_HALF_WIDTH) > _SAFE_MARGIN
             for obs in obstacles
         )
-        if start_safe and goal_safe:
+
+        # Reject if any two obstacles are so close the robot can't pass between
+        obs_passable = True
+        for i in range(len(obstacles)):
+            for j in range(i + 1, len(obstacles)):
+                gap = (np.linalg.norm(obstacles[i].center - obstacles[j].center)
+                       - obstacles[i].radius - obstacles[j].radius)
+                if gap < _ROBOT_DIAM:
+                    obs_passable = False
+                    break
+            if not obs_passable:
+                break
+
+        if start_safe and goal_safe and obs_passable:
             break
 
     return Episode(start=start, goal=goal, obstacles=obstacles)
