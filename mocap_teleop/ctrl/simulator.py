@@ -52,25 +52,37 @@ class Episode:
 
 class KinematicSim:
     """
-    2D kinematic point-mass robot.
+    2D first-order-lag robot (2nd-order system).
 
-    The control input is a body-frame velocity [vx, vy].
-    Heading (yaw) is updated separately or derived from motion direction.
+    The control input is a body-frame velocity command u_cmd = [vx, vy].
+    Actual velocity v_actual tracks u_cmd through a first-order lag:
+
+        τ · v̇_actual = u_cmd − v_actual   →   Euler: v += (u − v) * dt/τ
+
+    τ = 0.25 s is derived from the Go2 mpac controller acceleration limits:
+        τ = v_max / a_max = 0.3 m/s / 1.2 m/s² ≈ 0.25 s
+
+    This gives the correct 2nd-order structure for ECBF training:
+    h(p) has relative degree 2 w.r.t. u_cmd (through v_actual → ṗ → h).
     """
 
-    def __init__(self, dt: float = 0.05):
+    def __init__(self, dt: float = 0.05, tau: float = 0.25):
         self.dt:  float      = dt
+        self.tau: float      = tau
         self.pos: np.ndarray = np.zeros(2, dtype=np.float64)
+        self.vel: np.ndarray = np.zeros(2, dtype=np.float64)   # world frame
         self.yaw: float      = 0.0
 
     def reset(self, pos: np.ndarray, yaw: float = 0.0) -> None:
         self.pos = np.asarray(pos, dtype=np.float64).copy()
+        self.vel = np.zeros(2, dtype=np.float64)   # start from rest each episode
         self.yaw = float(yaw)
 
     def step(self, u_body: np.ndarray) -> None:
-        """Integrate one step.  u_body = [vx, vy] in body frame."""
+        """Integrate one step.  u_body = [vx, vy] command in body frame."""
         u_world   = body_to_world(u_body, self.yaw)
-        self.pos += u_world * self.dt
+        self.vel += (u_world - self.vel) * (self.dt / self.tau)
+        self.pos += self.vel * self.dt
 
     def heading_toward(self, target: np.ndarray) -> float:
         """Yaw angle pointing from current position to target."""
@@ -156,8 +168,7 @@ def sample_episode(
     max_r:        float = 0.8,
     min_sg_dist:  float = 1.5,
     obs_spread:   float = 0.4,
-    force_slalom:   bool  = False,
-    force_corridor: bool  = False,
+    force_slalom: bool  = False,
 ) -> Episode:
     """
     Sample a random training episode.
@@ -209,19 +220,14 @@ def sample_episode(
     path_perp = np.array([-path_dir[1], path_dir[0]])   # 90° left of path
 
     # Episode type probabilities for n_obstacles >= 2:
-    #   corridor (40%): two obstacles on OPPOSITE sides at the SAME path
-    #                   position, forming a narrow passage.  High α on both
-    #                   walls causes oscillation; the optimal α is moderate
-    #                   and symmetric, making fixed α=10 actively suboptimal.
-    #   slalom   (40%): alternating-side obstacles (existing design).
-    #   simple   (20%): one on-path + rest random (keeps diversity).
+    #   slalom (70%): alternating-side obstacles — the key geometry that
+    #                 creates non-monotonic α-performance coupling.
+    #   simple (30%): one on-path + rest random — keeps distribution diverse.
     rng = np.random.random()
-    if force_corridor:
-        episode_type = 'corridor'
-    elif force_slalom:
-        episode_type = 'corridor' if rng < 0.5 else 'slalom'
+    if force_slalom:
+        episode_type = 'slalom'
     elif n_obstacles >= 2:
-        episode_type = 'corridor' if rng < 0.4 else ('slalom' if rng < 0.8 else 'simple')
+        episode_type = 'slalom' if rng < 0.7 else 'simple'
     else:
         episode_type = 'simple'
 
@@ -235,35 +241,6 @@ def sample_episode(
             radius = np.random.uniform(min_r, max_r)
             obstacles.append(Obstacle(center=center, radius=radius))
             for _ in range(n_obstacles - 1):
-                c = np.random.uniform(-arena_half, arena_half, 2)
-                r = np.random.uniform(min_r, max_r)
-                obstacles.append(Obstacle(center=c, radius=r))
-
-        elif episode_type == 'corridor':
-            # ── Corridor: two obstacles on OPPOSITE sides at same position ─
-            # Both obstacles are placed at the same path fraction, one left
-            # and one right, with the gap between their surfaces set to just
-            # (1.0–2.0) × robot diameter.  The robot MUST pass between them.
-            #
-            # With high α on both, each wall pushes the robot toward the
-            # other, causing lateral oscillation and a longer path.  The
-            # network must learn a MODERATE α on both walls simultaneously —
-            # the first geometry where high α is actively harmful, making the
-            # performance curve non-monotonic in α.
-            t_corr   = np.random.uniform(0.30, 0.70)
-            r_left   = np.random.uniform(min_r, max_r)
-            r_right  = np.random.uniform(min_r, max_r)
-            gap_half = ROBOT_HALF_LENGTH + np.random.uniform(0.15, 0.50)
-            center_l = (start + t_corr * path_vec
-                        + (gap_half + r_left)  * path_perp
-                        + np.random.randn(2) * 0.05)
-            center_r = (start + t_corr * path_vec
-                        - (gap_half + r_right) * path_perp
-                        + np.random.randn(2) * 0.05)
-            obstacles.append(Obstacle(center=center_l, radius=r_left))
-            obstacles.append(Obstacle(center=center_r, radius=r_right))
-            # Fill remaining slots with random arena obstacles
-            for _ in range(n_obstacles - 2):
                 c = np.random.uniform(-arena_half, arena_half, 2)
                 r = np.random.uniform(min_r, max_r)
                 obstacles.append(Obstacle(center=c, radius=r))

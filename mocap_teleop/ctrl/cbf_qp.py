@@ -156,29 +156,36 @@ class CBFQP:
 
     def solve_fast(
         self,
-        u_perf_body: np.ndarray,
-        obstacles:   List[Obstacle],
-        p_robot:     np.ndarray,
-        yaw:         float,
-        alphas:      List[float],
+        u_perf_body:   np.ndarray,
+        obstacles:     List[Obstacle],
+        p_robot:       np.ndarray,
+        yaw:           float,
+        k_vals:        List[Tuple[float, float]],
+        v_actual_body: np.ndarray,
     ) -> np.ndarray:
         """
-        Solve the CBF-QP with OSQP.  Use this at runtime.
+        Solve the ECBF-QP with OSQP.  Use this at runtime.
+
+        ECBF constraint for a 2nd-order (first-order lag) system:
+            A · u_cmd ≥ −k1 · ḣ − k2 · h
+        where ḣ = (∂h/∂p) · v_actual.
 
         Parameters
         ----------
-        u_perf_body : (2,) nominal velocity in body frame [vx, vy]
-        obstacles   : list of Obstacle (world frame)
-        p_robot     : (2,) robot position in world frame
-        yaw         : robot heading (rad)
-        alphas      : scalar α_i per obstacle (must have same length as obstacles)
+        u_perf_body   : (2,) nominal velocity command in body frame [vx, vy]
+        obstacles     : list of Obstacle (world frame)
+        p_robot       : (2,) robot position in world frame
+        yaw           : robot heading (rad)
+        k_vals        : list of (k1, k2) per obstacle — ECBF gains from α-net
+        v_actual_body : (2,) actual robot velocity in body frame
 
         Returns
         -------
-        u_safe_body : (2,) safe velocity in body frame [vx, vy]
+        u_safe_body : (2,) safe velocity command in body frame [vx, vy]
                       Falls back to u_perf_body if the solver fails.
         """
-        u_perf_world = body_to_world(u_perf_body, yaw)
+        u_perf_world  = body_to_world(u_perf_body,   yaw)
+        v_actual_world = body_to_world(v_actual_body, yaw)
 
         # ── QP matrices ───────────────────────────────────────────────────────
         # min  0.5·uᵀ P u + qᵀ u     (P = 2I, q = -2·u_perf  →  ||u-u_perf||²)
@@ -186,8 +193,9 @@ class CBFQP:
         q = -2.0 * u_perf_world
 
         # ── Constraint matrix ─────────────────────────────────────────────────
-        # CBF rows:  (∂h_i/∂x) · u ≥ −α_i   →   lower bound = −α_i
-        # Box rows:  −v_max ≤ u_j ≤ v_max
+        # ECBF rows:  (∂h_i/∂p) · u_cmd ≥ −k1_i · ḣ_i − k2_i · h_i
+        # where ḣ_i = (∂h_i/∂p) · v_actual
+        # Box rows:   −v_max ≤ u_j ≤ v_max
         n = len(obstacles)
         if n > 0:
             grads = np.vstack([
@@ -195,14 +203,15 @@ class CBFQP:
                              self.robot_half_length, self.robot_half_width)
                 for obs in obstacles
             ])                                          # (n, 2)
-            # Standard class K CBF: ∂h/∂x · u ≥ −α · h(x)
             h_vals = np.array([
                 cbf_value(p_robot, obs.center, yaw, obs.radius,
                           self.robot_half_length, self.robot_half_width)
                 for obs in obstacles
             ])
-            rhs = np.array([-a * h
-                             for a, h in zip(alphas, h_vals)])    # (n,)
+            # ḣ_i = ∂h_i/∂p · v_actual  (world frame dot product)
+            h_dots = grads @ v_actual_world              # (n,)
+            rhs = np.array([-k[0] * hd - k[1] * h
+                             for k, hd, h in zip(k_vals, h_dots, h_vals)])  # (n,)
             # Normalise rows for consistent conditioning with training
             norms = np.linalg.norm(grads, axis=1, keepdims=True).clip(min=1e-6)
             A_cbf = grads / norms

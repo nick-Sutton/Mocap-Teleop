@@ -36,7 +36,7 @@ from typing import List
 import numpy as np
 import torch
 
-from mocap_teleop.ctrl.alpha_net import AlphaNet
+from mocap_teleop.ctrl.alpha_net import AlphaNet, _V_SCALE, _D_SCALE, _V_ACT_SCALE
 from mocap_teleop.ctrl.cbf_qp import (CBFQP, Obstacle, world_to_body,
                                        ROBOT_HALF_LENGTH)
 
@@ -80,20 +80,23 @@ class CbfSafetyFilter:
 
     def filter(
         self,
-        u_perf_body: np.ndarray,
-        robot_pos:   np.ndarray,
-        robot_yaw:   float,
-        obstacles:   List[Obstacle],
+        u_perf_body:   np.ndarray,
+        robot_pos:     np.ndarray,
+        robot_yaw:     float,
+        obstacles:     List[Obstacle],
+        v_actual_body: np.ndarray = None,
     ) -> np.ndarray:
         """
-        Apply the CBF safety filter to a nominal body-frame velocity command.
+        Apply the ECBF safety filter to a nominal body-frame velocity command.
 
         Parameters
         ----------
-        u_perf_body : (2,) [vx, vy] nominal velocity in robot body frame
-        robot_pos   : (2,) robot position in world/odom frame
-        robot_yaw   : robot heading (radians), world frame
-        obstacles   : list of Obstacle (center, radius) in world/odom frame
+        u_perf_body   : (2,) [vx, vy] nominal velocity in robot body frame
+        robot_pos     : (2,) robot position in world/odom frame
+        robot_yaw     : robot heading (radians), world frame
+        obstacles     : list of Obstacle (center, radius) in world/odom frame
+        v_actual_body : (2,) actual robot velocity in body frame (from odometry
+                        or mocap diff).  Defaults to zeros if not provided.
 
         Returns
         -------
@@ -103,6 +106,9 @@ class CbfSafetyFilter:
         """
         self.n_total += 1
 
+        if v_actual_body is None:
+            v_actual_body = np.zeros(2)
+
         if not self.enabled or len(obstacles) == 0:
             return u_perf_body.copy()
 
@@ -111,14 +117,16 @@ class CbfSafetyFilter:
         # excluding them keeps the QP small and fast.
         obs = self._select_closest(obstacles, robot_pos)
 
-        alphas = self._compute_alphas(u_perf_body, robot_pos, robot_yaw, obs)
+        k_vals = self._compute_k_vals(u_perf_body, robot_pos, robot_yaw,
+                                       v_actual_body, obs)
 
         u_safe_body = self._cbf_qp.solve_fast(
-            u_perf_body = u_perf_body,
-            obstacles   = obs,
-            p_robot     = robot_pos,
-            yaw         = robot_yaw,
-            alphas      = alphas,
+            u_perf_body   = u_perf_body,
+            obstacles     = obs,
+            p_robot       = robot_pos,
+            yaw           = robot_yaw,
+            k_vals        = k_vals,
+            v_actual_body = v_actual_body,
         )
 
         # Count as "filtered" if the command changed meaningfully
@@ -153,18 +161,19 @@ class CbfSafetyFilter:
         return [obstacles[i] for i in idx]
 
     @torch.no_grad()
-    def _compute_alphas(
+    def _compute_k_vals(
         self,
-        u_perf_body: np.ndarray,
-        robot_pos:   np.ndarray,
-        robot_yaw:   float,
-        obstacles:   List[Obstacle],
-    ) -> List[float]:
-        """Run α-net for each obstacle and return a list of scalar α values."""
+        u_perf_body:   np.ndarray,
+        robot_pos:     np.ndarray,
+        robot_yaw:     float,
+        v_actual_body: np.ndarray,
+        obstacles:     List[Obstacle],
+    ) -> List[tuple]:
+        """Run α-net for each obstacle and return a list of (k1, k2) tuples."""
         c, s = np.cos(robot_yaw), np.sin(robot_yaw)
         R    = np.array([[c, -s], [s, c]])   # body → world;  R^T = world → body
 
-        alphas = []
+        k_vals = []
         for obs in obstacles:
             d_world       = obs.center - robot_pos
             d_to_obs_body = R.T @ d_world
@@ -173,21 +182,26 @@ class CbfSafetyFilter:
                 - 1.0
             )
 
+            # d_to_goal proxy: u_perf × (D_SCALE / V_SCALE) ≈ 2 s of travel.
+            # Gives a vector in the commanded direction with ~3 m magnitude,
+            # matching the training distribution.
+            d_to_goal_proxy = u_perf_body * (_D_SCALE / _V_SCALE)
+
             feat = AlphaNet.build_input(
                 d_to_obs_body = torch.tensor(
-                    d_to_obs_body, dtype=torch.float32, device=self._device),
+                    d_to_obs_body,    dtype=torch.float32, device=self._device),
                 r             = torch.tensor(
-                    [obs.radius],  dtype=torch.float32, device=self._device),
+                    [obs.radius],     dtype=torch.float32, device=self._device),
                 h             = torch.tensor(
-                    [h_val],       dtype=torch.float32, device=self._device),
+                    [h_val],          dtype=torch.float32, device=self._device),
                 u_perf        = torch.tensor(
-                    u_perf_body,   dtype=torch.float32, device=self._device),
+                    u_perf_body,      dtype=torch.float32, device=self._device),
                 d_to_goal     = torch.tensor(
-                    d_to_obs_body, dtype=torch.float32, device=self._device),
-                # NOTE: d_to_goal at deployment = d_to_obs_body as a proxy.
-                # The ideal value is (human_pos − robot_pos) in body frame,
-                # which can be wired in once the human position is passed here.
+                    d_to_goal_proxy,  dtype=torch.float32, device=self._device),
+                v_actual_body = torch.tensor(
+                    v_actual_body,    dtype=torch.float32, device=self._device),
             )
-            alphas.append(float(self._alpha_net(feat).cpu().item()))
+            k = self._alpha_net(feat).cpu().numpy().flatten()
+            k_vals.append((float(k[0]), float(k[1])))
 
-        return alphas
+        return k_vals

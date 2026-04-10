@@ -1,0 +1,12 @@
+Perception
+RPi ARMv7
+Raspbian GNU/Linux 10 (Buster)
+4 GB RAM
+64 GB HDD
+
+Control
+intel atom x5-Z8350 @1.44 GHz
+Ubuntu 16.04.6 LTS
+4.4.86-rt99 #1 SMP PREEMPT RT kernel
+4 GB RAM (max capacity 8 GB), DDR3 1600MHz
+32 GB HDD
