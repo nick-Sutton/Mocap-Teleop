@@ -12,6 +12,7 @@ install(PROGRAMS
   mocap_teleop/modes/online_node.py
   mocap_teleop/teleop_node.py
   mocap_teleop/modes/offline_node.py
+  mocap_teleop/ctrl/obstacle_sim_node.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

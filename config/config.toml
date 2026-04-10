@@ -25,7 +25,7 @@ interface_subpath = "~/repos/mpac/mpac_go2/atnmy/"
 gait_classifier_path = "ModelV1.pth"
 # Absolute path to trained α-net weights. Set to enable the CBF safety filter.
 # Leave empty to run without the filter.
-cbf_model_path = "alpha_net_v5.pth"
+cbf_model_path = "alpha_net.pth"
 
 [logging]
 logs_dir = "robot_logs"

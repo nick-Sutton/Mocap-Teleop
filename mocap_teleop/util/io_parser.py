@@ -27,8 +27,20 @@ def parse_mocap_config() -> dict:
 
 def parse_learning_config() -> dict:
     config = parse_config()
+    cfg = dict(config['learning'])
 
-    return config['learning']
+    # Resolve relative model paths to the workspace src directory so the
+    # node finds the weights regardless of the launch working directory.
+    pkg_share = get_package_share_directory('mocap_teleop')
+    ws_root   = os.path.normpath(os.path.join(pkg_share, '..', '..', '..', '..'))
+    src_dir   = os.path.join(ws_root, 'src', 'mocap_teleop')
+
+    for key in ('gait_classifier_path', 'cbf_model_path'):
+        raw = cfg.get(key, '')
+        if raw and not os.path.isabs(raw):
+            cfg[key] = os.path.join(src_dir, raw)
+
+    return cfg
 
 def parse_controller_config() -> dict:
     config = parse_config()
