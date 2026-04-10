@@ -19,7 +19,7 @@ and sees the real mocap command instead of the PD controller output.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -32,10 +32,20 @@ from mocap_teleop.ctrl.cbf_qp import (Obstacle, body_to_world, world_to_body,
 
 @dataclass
 class Episode:
-    """One training episode: a start position, a goal, and a set of obstacles."""
-    start:     np.ndarray         # (2,) world frame
-    goal:      np.ndarray         # (2,) world frame
-    obstacles: List[Obstacle] = field(default_factory=list)
+    """One training episode: a start position, a goal, and a set of obstacles.
+
+    For teleop episodes (human_dir is not None):
+      human_dir — unit vector of the human's walking direction
+      v_human   — human's constant forward speed (m/s)
+      goal      — human's final position: start + v_human * T * dt * human_dir
+
+    human_pos(t) = start + t * dt * v_human * human_dir
+    """
+    start:     np.ndarray             # (2,) world frame
+    goal:      np.ndarray             # (2,) world frame
+    obstacles: List[Obstacle]         = field(default_factory=list)
+    human_dir: Optional[np.ndarray]  = None   # set for teleop episodes
+    v_human:   float                  = 1.5   # human speed (m/s)
 
 
 # ── Kinematic robot ───────────────────────────────────────────────────────────
@@ -115,6 +125,30 @@ class PDController:
 
 # ── Episode sampler ───────────────────────────────────────────────────────────
 
+def _obstacles_valid(
+    obstacles:   List[Obstacle],
+    start:       np.ndarray,
+    goal:        np.ndarray,
+    safe_margin: float,
+    min_gap:     float,
+) -> bool:
+    """Return True if start/goal are clear and no two obstacles are too close."""
+    for obs in obstacles:
+        if _cbf_value(start, obs.center, 0.0, obs.radius,
+                      ROBOT_HALF_LENGTH, ROBOT_HALF_WIDTH) <= safe_margin:
+            return False
+        if _cbf_value(goal, obs.center, 0.0, obs.radius,
+                      ROBOT_HALF_LENGTH, ROBOT_HALF_WIDTH) <= safe_margin:
+            return False
+    for i in range(len(obstacles)):
+        for j in range(i + 1, len(obstacles)):
+            gap = (np.linalg.norm(obstacles[i].center - obstacles[j].center)
+                   - obstacles[i].radius - obstacles[j].radius)
+            if gap < min_gap:
+                return False
+    return True
+
+
 def sample_episode(
     n_obstacles:  int   = 1,
     arena_half:   float = 3.0,
@@ -122,17 +156,34 @@ def sample_episode(
     max_r:        float = 0.8,
     min_sg_dist:  float = 1.5,
     obs_spread:   float = 0.4,
+    force_slalom:   bool  = False,
+    force_corridor: bool  = False,
 ) -> Episode:
     """
     Sample a random training episode.
 
-    Obstacles are placed near the straight-line path from start to goal
-    so the robot has to actively avoid them rather than going around.
+    Episode types
+    ─────────────
+    n_obstacles = 1  →  single on-path obstacle (original design).
 
-    For multi-obstacle episodes, obstacles are guaranteed not to mutually
-    overlap (with enough clearance for the robot to pass between any pair),
-    preventing infeasible CBF-QP configurations where constraints point in
-    irreconcilable directions.
+    n_obstacles ≥ 2  →  randomly chooses between two types each call:
+
+      Slalom (70 % of multi-obstacle episodes)
+        Obstacles are placed at evenly-spaced positions along the path,
+        alternating LEFT and RIGHT of the centre line.  The robot must
+        navigate an S-curve: its lateral displacement after avoiding
+        obstacle k determines its approach angle to obstacle k+1.
+        Being too aggressive on obstacle k (high α_k) pushes the robot
+        further off-centre and makes obstacle k+1 harder to avoid.
+        This is the geometric coupling that forces the network to learn
+        environment-dependent α rather than a constant maximum.
+
+      Simple (30 % of multi-obstacle episodes)
+        One on-path obstacle + remaining obstacles placed randomly in the
+        arena.  Keeps the training distribution diverse and provides signal
+        for "non-threatening" obstacles (network should learn high α).
+
+    All episodes guarantee start/goal safety and inter-obstacle clearance.
 
     Parameters
     ----------
@@ -141,15 +192,10 @@ def sample_episode(
     min_r        : minimum obstacle radius (m)
     max_r        : maximum obstacle radius (m)
     min_sg_dist  : minimum required distance between start and goal (m)
-    obs_spread   : std-dev of the lateral scatter around the straight-line path (m)
+    obs_spread   : lateral noise added to slalom obstacle positions (m)
     """
-    # With multiple obstacles reduce max radius so they don't collectively
-    # block all corridors (3 × 0.8m obstacles can wall off a short path).
-    effective_max_r = max_r if n_obstacles == 1 else min(max_r, 0.5)
-
-    # Robot diameter — minimum gap we must leave between any two obstacles
-    # so the robot can physically fit through.
-    _ROBOT_DIAM  = 2.0 * ROBOT_HALF_LENGTH + 0.3   # add 0.3 m clearance
+    _SAFE_MARGIN = 0.3
+    _MIN_GAP     = 2.0 * ROBOT_HALF_LENGTH + 0.2   # robot fits between any pair
 
     # Rejection-sample start/goal pair with sufficient separation
     while True:
@@ -158,48 +204,228 @@ def sample_episode(
         if np.linalg.norm(goal - start) >= min_sg_dist:
             break
 
-    # Sample obstacles, rejection-sampling until:
-    #   1. Start and goal are both clear of all obstacles.
-    #   2. No two obstacles overlap (robot can pass between every pair).
-    # This guarantees h(x_0) > 0 and the CBF-QP is never trivially infeasible
-    # due to conflicting constraint gradients from packed obstacles.
-    _SAFE_MARGIN = 0.3   # metres — minimum h value required at start and goal
-    for _ in range(500):
-        obstacles = []
-        for _ in range(n_obstacles):
-            t      = np.random.uniform(0.20, 0.80)
-            center = start + t * (goal - start) + np.random.randn(2) * obs_spread
-            radius = np.random.uniform(min_r, effective_max_r)
+    path_vec  = goal - start
+    path_dir  = path_vec / np.linalg.norm(path_vec)
+    path_perp = np.array([-path_dir[1], path_dir[0]])   # 90° left of path
+
+    # Episode type probabilities for n_obstacles >= 2:
+    #   corridor (40%): two obstacles on OPPOSITE sides at the SAME path
+    #                   position, forming a narrow passage.  High α on both
+    #                   walls causes oscillation; the optimal α is moderate
+    #                   and symmetric, making fixed α=10 actively suboptimal.
+    #   slalom   (40%): alternating-side obstacles (existing design).
+    #   simple   (20%): one on-path + rest random (keeps diversity).
+    rng = np.random.random()
+    if force_corridor:
+        episode_type = 'corridor'
+    elif force_slalom:
+        episode_type = 'corridor' if rng < 0.5 else 'slalom'
+    elif n_obstacles >= 2:
+        episode_type = 'corridor' if rng < 0.4 else ('slalom' if rng < 0.8 else 'simple')
+    else:
+        episode_type = 'simple'
+
+    for _ in range(1000):
+        obstacles: List[Obstacle] = []
+
+        if episode_type == 'simple':
+            # ── Simple: one on-path + rest random ─────────────────────────
+            t      = np.random.uniform(0.25, 0.75)
+            center = start + t * path_vec + np.random.randn(2) * obs_spread
+            radius = np.random.uniform(min_r, max_r)
             obstacles.append(Obstacle(center=center, radius=radius))
+            for _ in range(n_obstacles - 1):
+                c = np.random.uniform(-arena_half, arena_half, 2)
+                r = np.random.uniform(min_r, max_r)
+                obstacles.append(Obstacle(center=c, radius=r))
 
-        # Reject if robot starts or ends inside (or too close to) any obstacle
-        start_safe = all(
-            _cbf_value(start, obs.center, 0.0, obs.radius,
-                       ROBOT_HALF_LENGTH, ROBOT_HALF_WIDTH) > _SAFE_MARGIN
-            for obs in obstacles
-        )
-        goal_safe = all(
-            _cbf_value(goal, obs.center, 0.0, obs.radius,
-                       ROBOT_HALF_LENGTH, ROBOT_HALF_WIDTH) > _SAFE_MARGIN
-            for obs in obstacles
-        )
+        elif episode_type == 'corridor':
+            # ── Corridor: two obstacles on OPPOSITE sides at same position ─
+            # Both obstacles are placed at the same path fraction, one left
+            # and one right, with the gap between their surfaces set to just
+            # (1.0–2.0) × robot diameter.  The robot MUST pass between them.
+            #
+            # With high α on both, each wall pushes the robot toward the
+            # other, causing lateral oscillation and a longer path.  The
+            # network must learn a MODERATE α on both walls simultaneously —
+            # the first geometry where high α is actively harmful, making the
+            # performance curve non-monotonic in α.
+            t_corr   = np.random.uniform(0.30, 0.70)
+            r_left   = np.random.uniform(min_r, max_r)
+            r_right  = np.random.uniform(min_r, max_r)
+            gap_half = ROBOT_HALF_LENGTH + np.random.uniform(0.15, 0.50)
+            center_l = (start + t_corr * path_vec
+                        + (gap_half + r_left)  * path_perp
+                        + np.random.randn(2) * 0.05)
+            center_r = (start + t_corr * path_vec
+                        - (gap_half + r_right) * path_perp
+                        + np.random.randn(2) * 0.05)
+            obstacles.append(Obstacle(center=center_l, radius=r_left))
+            obstacles.append(Obstacle(center=center_r, radius=r_right))
+            # Fill remaining slots with random arena obstacles
+            for _ in range(n_obstacles - 2):
+                c = np.random.uniform(-arena_half, arena_half, 2)
+                r = np.random.uniform(min_r, max_r)
+                obstacles.append(Obstacle(center=c, radius=r))
 
-        # Reject if any two obstacles are so close the robot can't pass between
-        obs_passable = True
-        for i in range(len(obstacles)):
-            for j in range(i + 1, len(obstacles)):
-                gap = (np.linalg.norm(obstacles[i].center - obstacles[j].center)
-                       - obstacles[i].radius - obstacles[j].radius)
-                if gap < _ROBOT_DIAM:
-                    obs_passable = False
+        else:
+            # ── Slalom: alternating-side obstacles along path ─────────────
+            n_slalom = min(n_obstacles, 3)
+            ts       = np.linspace(0.25, 0.75, n_slalom)
+            for i, t in enumerate(ts):
+                radius  = np.random.uniform(min_r, max_r)
+                side    = 1.0 if i % 2 == 0 else -1.0
+                lateral = side * (radius + ROBOT_HALF_LENGTH
+                                  + np.random.uniform(0.05, 0.30))
+                center  = (start + t * path_vec
+                           + lateral * path_perp
+                           + np.random.randn(2) * 0.1)
+                obstacles.append(Obstacle(center=center, radius=radius))
+            for _ in range(n_obstacles - n_slalom):
+                c = np.random.uniform(-arena_half, arena_half, 2)
+                r = np.random.uniform(min_r, max_r)
+                obstacles.append(Obstacle(center=c, radius=r))
+
+        if _obstacles_valid(obstacles, start, goal, _SAFE_MARGIN, _MIN_GAP):
+            return Episode(start=start, goal=goal, obstacles=obstacles)
+
+    # Fallback: relax gap check, keep count and start/goal safety
+    while True:
+        t      = np.random.uniform(0.25, 0.75)
+        center = start + t * path_vec + np.random.randn(2) * obs_spread
+        radius = np.random.uniform(min_r, max_r)
+        obstacles = [Obstacle(center=center, radius=radius)]
+        for _ in range(n_obstacles - 1):
+            c = np.random.uniform(-arena_half, arena_half, 2)
+            r = np.random.uniform(min_r, max_r)
+            obstacles.append(Obstacle(center=c, radius=r))
+        if all(_cbf_value(start, o.center, 0.0, o.radius,
+                          ROBOT_HALF_LENGTH, ROBOT_HALF_WIDTH) > _SAFE_MARGIN
+               for o in obstacles) and \
+           all(_cbf_value(goal,  o.center, 0.0, o.radius,
+                          ROBOT_HALF_LENGTH, ROBOT_HALF_WIDTH) > _SAFE_MARGIN
+               for o in obstacles):
+            return Episode(start=start, goal=goal, obstacles=obstacles)
+
+
+# ── Teleop episode sampler ────────────────────────────────────────────────────
+
+def sample_teleop_episode(
+    n_obstacles:  int   = 1,
+    arena_half:   float = 3.0,
+    min_r:        float = 0.3,
+    max_r:        float = 0.8,
+    v_human:      float = 1.5,
+    T:            int   = 100,
+    dt:           float = 0.05,
+) -> Episode:
+    """
+    Sample a teleop training episode.
+
+    The human walks in a straight line at constant speed v_human.  The robot
+    starts co-located with the human and must track the human while avoiding
+    obstacles the human ignores.
+
+    Episode types
+    ─────────────
+      corridor (60 %, n_obstacles ≥ 2):
+        Two obstacles straddle the human path at the same along-path position
+        forming a narrow passage (gap = 1.0–1.8 × robot width).  The robot
+        must pass between them while staying close to the human trajectory.
+        High α on both walls → each wall's CBF pushes the robot toward the
+        other wall → lateral oscillation → large deviation from human path.
+        Low α → late response → collision.
+        Moderate α → smooth threading.
+        This is GENUINELY non-monotonic: no single α is universally optimal.
+
+      single (40 %, always for n_obstacles = 1):
+        One obstacle at δ ∈ (0.72, 0.98)×(a+r) from the human path.
+        The δ ≥ 0.72×(a+r) lower bound ensures geometric feasibility: the
+        required lateral speed at h=0 is v·√(1−δ²/r²) ≤ v_max.
+        Provides diverse single-obstacle geometry.
+
+    Returns
+    -------
+    Episode with human_dir and v_human set.
+      goal = start + v_human * T * dt * human_dir  (human's final position)
+    """
+    _SAFE_MARGIN = 0.3
+    path_length  = v_human * T * dt   # e.g. 1.5 m/s × 100 × 0.05 s = 7.5 m
+
+    while True:
+        # Human walks from a random start in a random direction.
+        # No goal-in-arena check: obstacles are placed along the path (within
+        # the first 85 % of path_length ≈ 6 m from start), so the goal can
+        # be outside the arena without affecting the training signal.
+        start     = np.random.uniform(-arena_half, arena_half, 2)
+        angle     = np.random.uniform(0, 2 * np.pi)
+        human_dir = np.array([np.cos(angle), np.sin(angle)])
+        perp      = np.array([-human_dir[1], human_dir[0]])   # 90° left
+        goal      = start + path_length * human_dir
+
+        for _ in range(500):
+            valid     = True
+            obs_list: List[Obstacle] = []
+
+            # Episode type:
+            #   corridor (60 % when n_obstacles ≥ 2): two obstacles straddling
+            #     the human path at the same along-path position, forming a
+            #     narrow passage.  The robot MUST pass between them.
+            #     High α on both walls → oscillation → large lateral deviation.
+            #     Low α on both walls → late response → collision.
+            #     Moderate α → smooth threading → stays with human.
+            #     This is genuinely non-monotonic in the teleop lateral loss.
+            #   single (40 %, or always for n_obstacles = 1): one obstacle at
+            #     δ ∈ (0.72, 0.98)×safe_r.  Provides single-obstacle geometry.
+            use_corridor = (n_obstacles >= 2 and np.random.random() < 0.60)
+
+            if use_corridor:
+                t_frac  = np.random.uniform(0.20, 0.70)
+                on_path = start + t_frac * path_length * human_dir
+                r_l     = np.random.uniform(min_r, max_r)
+                r_r     = np.random.uniform(min_r, max_r)
+                # gap_half: half the clear width between surface-to-surface.
+                # Must exceed ROBOT_HALF_WIDTH so the robot can fit through.
+                gap_half = ROBOT_HALF_WIDTH * np.random.uniform(1.0, 1.8)
+                obs_list.append(Obstacle(
+                    center=on_path + (gap_half + r_l) * perp, radius=r_l))
+                obs_list.append(Obstacle(
+                    center=on_path - (gap_half + r_r) * perp, radius=r_r))
+                # Fill remaining slots with single-type obstacles
+                for _ in range(n_obstacles - 2):
+                    r2     = np.random.uniform(min_r, max_r)
+                    sr2    = ROBOT_HALF_LENGTH + r2
+                    t2     = np.random.uniform(0.15, 0.85)
+                    side   = np.random.choice([-1.0, 1.0])
+                    delta  = np.random.uniform(0.72 * sr2, 0.98 * sr2)
+                    obs_list.append(Obstacle(
+                        center=start + t2 * path_length * human_dir
+                               + side * delta * perp,
+                        radius=r2))
+            else:
+                for _ in range(n_obstacles):
+                    r      = np.random.uniform(min_r, max_r)
+                    sr     = ROBOT_HALF_LENGTH + r
+                    t_frac = np.random.uniform(0.15, 0.85)
+                    side   = np.random.choice([-1.0, 1.0])
+                    delta  = np.random.uniform(0.72 * sr, 0.98 * sr)
+                    obs_list.append(Obstacle(
+                        center=start + t_frac * path_length * human_dir
+                               + side * delta * perp,
+                        radius=r))
+
+            # All obstacles must be safe from the robot's start position
+            for obs in obs_list:
+                if _cbf_value(start, obs.center, 0.0, obs.radius,
+                              ROBOT_HALF_LENGTH, ROBOT_HALF_WIDTH) <= _SAFE_MARGIN:
+                    valid = False
                     break
-            if not obs_passable:
-                break
 
-        if start_safe and goal_safe and obs_passable:
-            break
+            if valid:
+                return Episode(start=start, goal=goal, obstacles=obs_list,
+                               human_dir=human_dir, v_human=v_human)
 
-    return Episode(start=start, goal=goal, obstacles=obstacles)
+        # Fallback: relax start-safety and try again
 
 
 # ── Trajectory rollout (numpy, no gradients) ─────────────────────────────────

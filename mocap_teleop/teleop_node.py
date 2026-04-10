@@ -32,12 +32,15 @@ from rclpy.node import Node
 from rclpy.executors import SingleThreadedExecutor, ExternalShutdownException
 from geometry_msgs.msg import Twist, PoseStamped
 from std_msgs.msg import String, Bool
+from visualization_msgs.msg import MarkerArray
 
 from mocap_teleop_msgs.msg import HumanState
 from mocap_teleop.state.human import Human
 from mocap_teleop.mapper.motion_mapper import MotionMapper
 from mocap_teleop.model.gait_classifier import GaitClassifier
 from mocap_teleop.ctrl.ctrl_interface import CtrlInterface
+from mocap_teleop.ctrl.cbf_safety_filter import CbfSafetyFilter
+from mocap_teleop.ctrl.cbf_qp import Obstacle
 from mocap_teleop.util.freq_meter import FrequencyMeter
 from mocap_teleop.util.performance_metrics import PerformanceMetrics
 import mocap_teleop.util.io_parser as io
@@ -73,6 +76,27 @@ class TeleopNode(Node):
         self.gc     = GaitClassifier(model_path)
         self.get_logger().info('Gait classifier ready')
 
+        # ── CBF safety filter ─────────────────────────────────────────────────
+        cbf_model_path = learning_cfg.get('cbf_model_path', '')
+        cbf_enabled    = bool(cbf_model_path) and os.path.isfile(cbf_model_path)
+        if cbf_enabled:
+            self.get_logger().info(f'Loading CBF α-net from {cbf_model_path}...')
+            self._cbf_filter = CbfSafetyFilter(
+                model_path = cbf_model_path,
+                v_max      = self.mapper.MAX_LINEAR_VEL,
+                enabled    = True,
+            )
+            self.get_logger().info('CBF safety filter ready')
+        else:
+            self._cbf_filter = None
+            if cbf_model_path:
+                self.get_logger().warn(
+                    f'CBF model path set but file not found: {cbf_model_path}'
+                    ' — safety filter disabled')
+            else:
+                self.get_logger().info(
+                    'CBF model path not set — safety filter disabled')
+
         # ── Stand up before starting control threads ──────────────────────────
         self.get_logger().info('Sending stand command — waiting 3 s for robot to stand...')
         CtrlInterface.stand(0, 0, 0)
@@ -88,6 +112,10 @@ class TeleopNode(Node):
         self._gait_confidence:    float             = 0.0
         self._last_cmd_vel:       np.ndarray | None = None
         self._running:            bool              = True
+        # Obstacle list updated by /obstacles subscriber, consumed by PD thread.
+        # Written by the subscriber callback (ROS2 executor thread) and read by
+        # the PD thread — list replacement is GIL-atomic in CPython.
+        self._obstacles:          list              = []
 
         # ── Frequency meters ──────────────────────────────────────────────────
         self._freq_mocap      = FrequencyMeter(window=100)
@@ -114,6 +142,14 @@ class TeleopNode(Node):
         self.create_subscription(
             Bool, '/mocap/tracking_valid',
             self._tracking_valid_cb, 10)
+        # Obstacles published as a MarkerArray of SPHERE markers.
+        # Each marker: position = obstacle center (odom frame),
+        #              scale.x  = obstacle diameter (radius = scale.x / 2).
+        # Publish to /obstacles from your perception node.
+        if self._cbf_filter is not None:
+            self.create_subscription(
+                MarkerArray, '/obstacles',
+                self._obstacles_cb, 10)
 
         # ── Publishers ────────────────────────────────────────────────────────
         self._cmd_vel_pub = self.create_publisher(Twist,  '/cmd_vel',     10)
@@ -150,6 +186,25 @@ class TeleopNode(Node):
 
     def _tracking_valid_cb(self, msg: Bool) -> None:
         pass   # consumed by the mocap timeout mechanism
+
+    def _obstacles_cb(self, msg: MarkerArray) -> None:
+        """Convert incoming MarkerArray into a list of Obstacle objects.
+
+        Expects SPHERE markers with:
+          pose.position.{x,y} — obstacle center in odom frame
+          scale.x             — sphere diameter (radius = scale.x / 2)
+
+        This is the standard format from most ROS2 obstacle detection packages.
+        List replacement is GIL-atomic so no lock is needed.
+        """
+        obs = []
+        for marker in msg.markers:
+            center = np.array([marker.pose.position.x,
+                               marker.pose.position.y])
+            radius = marker.scale.x / 2.0
+            if radius > 0.01:   # ignore degenerate markers
+                obs.append(Obstacle(center=center, radius=radius))
+        self._obstacles = obs
 
     # ── Buffer-fill thread ────────────────────────────────────────────────────
 
@@ -246,9 +301,31 @@ class TeleopNode(Node):
                                 root_pose       = self._latest_human_state.root_pose,
                             )
 
+                            # ── CBF safety filter ─────────────────────────────
+                            # Intercept the translational command and deflect
+                            # the robot around any detected obstacles before
+                            # sending to the hardware.  vrz passes through.
+                            if self._cbf_filter is not None:
+                                from scipy.spatial.transform import Rotation as _R
+                                yaw = _R.from_quat([
+                                    float(quat[0]), float(quat[1]),
+                                    float(quat[2]), float(quat[3]),
+                                ]).as_euler('xyz')[2]
+                                u_safe = self._cbf_filter.filter(
+                                    u_perf_body = np.array(cmd_vel[:2],
+                                                           dtype=np.float64),
+                                    robot_pos   = np.array(pos[:2],
+                                                           dtype=np.float64),
+                                    robot_yaw   = float(yaw),
+                                    obstacles   = self._obstacles,
+                                )
+                                vx_cmd, vy_cmd = float(u_safe[0]), float(u_safe[1])
+                            else:
+                                vx_cmd, vy_cmd = float(cmd_vel[0]), float(cmd_vel[1])
+
                             CtrlInterface.walk(
-                                vx  = float(cmd_vel[0]),
-                                vy  = float(cmd_vel[1]),
+                                vx  = vx_cmd,
+                                vy  = vy_cmd,
                                 vrz = float(cmd_vel[2]),
                             )
 
@@ -293,11 +370,16 @@ class TeleopNode(Node):
                     if self._gait_prediction else 'buffering')
         cmd_str = (f'vx={self._last_cmd_vel[0]:.3f} vy={self._last_cmd_vel[1]:.3f} vrz={self._last_cmd_vel[2]:.3f}'
                    if self._last_cmd_vel is not None else 'none')
+        cbf_str = ''
+        if self._cbf_filter is not None:
+            stats   = self._cbf_filter.reset_counters()
+            cbf_str = (f'  cbf={stats["filter_pct"]:.0f}%active'
+                       f'  obs={len(self._obstacles)}')
         self.get_logger().info(
             f'[freq] mocap={mocap_hz:.1f} Hz  '
             f'classifier={classifier_hz:.1f} Hz  '
             f'pd_ctrl={pd_hz:.1f} Hz  '
-            f'gait={gait_str}  cmd={cmd_str}'
+            f'gait={gait_str}  cmd={cmd_str}{cbf_str}'
         )
 
     # ── Shutdown ──────────────────────────────────────────────────────────────

@@ -201,7 +201,7 @@ class CBFQP:
                           self.robot_half_length, self.robot_half_width)
                 for obs in obstacles
             ])
-            rhs = np.array([-a * max(h, 0.0)
+            rhs = np.array([-a * h
                              for a, h in zip(alphas, h_vals)])    # (n,)
             # Normalise rows for consistent conditioning with training
             norms = np.linalg.norm(grads, axis=1, keepdims=True).clip(min=1e-6)
@@ -294,16 +294,33 @@ class CBFQP:
         # single-obstacle case, eliminating the train/eval mismatch that made
         # the softplus approach fail.
 
-        n_cbf = A_cbf_t.shape[1]
-        u     = u_perf_world_t.clone()   # (B, 2)
+        n_cbf   = A_cbf_t.shape[1]
+        u       = u_perf_world_t.clone()   # (B, 2)
+        v_max_t = torch.tensor(self.v_max, dtype=u.dtype, device=dev)
 
-        for i in range(n_cbf):
-            a    = A_cbf_t[:, i, :]                          # (B, 2)
-            b    = b_cbf_t[:, i]                             # (B,)
-            dot  = (a * u).sum(-1)                           # (B,)
-            a_sq = (a * a).sum(-1).clamp(min=1e-8)           # (B,)
-            viol = torch.nn.functional.relu(b - dot)         # (B,)  exact violation
-            u    = u + (viol / a_sq).unsqueeze(-1) * a
+        # Dykstra's alternating projection over all constraint sets.
+        # For n_cbf=1 one cycle is exact.  For n_cbf>1 each cycle tightens
+        # the solution; 15 cycles gives near-exact results for ≤5 constraints
+        # in 2D at negligible cost (pure PyTorch ops, fully GPU-native).
+        # The incremental correction vectors p (one per constraint) are the
+        # standard Dykstra correction that ensures convergence to the true
+        # projection onto the constraint intersection, not just the last set.
+        p = torch.zeros(u.shape[0], n_cbf, 2, device=dev, dtype=u.dtype)  # (B, n_cbf, 2)
 
-        # Box constraint — hard clip is fine, α-net doesn't depend on v_max
-        return u.clamp(-self.v_max, self.v_max)
+        for _ in range(15):
+            for i in range(n_cbf):
+                y    = u + p[:, i, :]                            # Dykstra correction
+                a    = A_cbf_t[:, i, :]                          # (B, 2)
+                b    = b_cbf_t[:, i]                             # (B,)
+                dot  = (a * y).sum(-1)                           # (B,)
+                a_sq = (a * a).sum(-1).clamp(min=1e-8)           # (B,)
+                viol = torch.nn.functional.relu(b - dot)         # exact violation
+                y_proj = y + (viol / a_sq).unsqueeze(-1) * a
+                p[:, i, :] = p[:, i, :] + u - y_proj            # update correction
+                u = y_proj
+
+            # Box constraint projection inside the cycle so it participates
+            # in the Dykstra convergence rather than being a hard override at end
+            u = u.clamp(-v_max_t, v_max_t)
+
+        return u

@@ -44,8 +44,10 @@ import torch
 
 from mocap_teleop.ctrl.alpha_net import AlphaNet
 from mocap_teleop.ctrl.cbf_qp import (CBFQP, Obstacle, ellipse_Q,
+                                       world_to_body,
                                        ROBOT_HALF_LENGTH, ROBOT_HALF_WIDTH)
-from mocap_teleop.ctrl.simulator import Episode, PDController, sample_episode
+from mocap_teleop.ctrl.simulator import (Episode, PDController,
+                                          sample_episode, sample_teleop_episode)
 
 # ── Hyperparameters ───────────────────────────────────────────────────────────
 
@@ -55,7 +57,8 @@ _DT             = 0.05    # simulation timestep (s)  →  5 s per episode
 _N_ITERS        = 150     # training iterations
 _N_ENVS         = 30      # environments sampled per iteration
 _LR             = 3e-4    # Adam learning rate
-_SLACK_WEIGHT   = 100.0   # λ_δ — penalty for CBF constraint violations
+_SLACK_WEIGHT        = 100.0   # λ_δ — penalty for CBF constraint violations (goal mode)
+_SLACK_WEIGHT_TELEOP = 500.0   # higher because path_length_sq ≈ 56 >> typical dist0_sq ≈ 9
 _CHECKPOINT_DIR = '.'     # directory to save checkpoints
 
 
@@ -239,6 +242,189 @@ def _rollout_batch(
     return loss / B
 
 
+# ── Teleop rollout (differentiable) ──────────────────────────────────────────
+
+def _rollout_batch_teleop(
+    alpha_net: AlphaNet,
+    cbf_qp:    CBFQP,
+    episodes:  List[Episode],
+    device:    torch.device,
+) -> torch.Tensor:
+    """
+    Teleop rollout: the human walks straight at constant speed; the robot
+    tries to track the human trajectory while avoiding obstacles.
+
+    Loss per episode = Σ_t ‖pos(t) − human_pos(t)‖² / path_length²
+                     + λ · Σ_t relu(margin − h_i(pos(t)))²  / path_length²
+
+    where human_pos(t) = start + t · dt · v_human · human_dir.
+
+    Key differences from _rollout_batch
+    ─────────────────────────────────────
+    • u_perf is constant: v_human · human_dir (human command, not PD).
+    • Yaw is constant: direction of human travel.
+    • d_to_goal feature → d_to_human(t) = human_pos(t) − pos(t) (dynamic).
+    • Normalisation uses path_length² instead of initial distance² (robot and
+      human start co-located, so dist0 = 0).
+    """
+    B     = len(episodes)
+    n_obs = len(episodes[0].obstacles)
+
+    pos = torch.tensor(
+        np.stack([ep.start for ep in episodes]),
+        dtype=torch.float32, device=device)                         # (B, 2)
+    centers = torch.tensor(
+        np.array([[obs.center for obs in ep.obstacles] for ep in episodes]),
+        dtype=torch.float32, device=device)                         # (B, n_obs, 2)
+    radii = torch.tensor(
+        np.array([[obs.radius for obs in ep.obstacles] for ep in episodes]),
+        dtype=torch.float32, device=device)                         # (B, n_obs)
+
+    # Human trajectory parameters (constant per episode)
+    human_dirs = torch.tensor(
+        np.stack([ep.human_dir for ep in episodes]),
+        dtype=torch.float32, device=device)                         # (B, 2)
+    v_humans = torch.tensor(
+        [ep.v_human for ep in episodes],
+        dtype=torch.float32, device=device)                         # (B,)
+
+    # u_perf = v_human * human_dir (constant, no PD controller)
+    u_perf_world_t = v_humans.unsqueeze(-1) * human_dirs           # (B, 2)
+
+    # Yaw = human direction (constant — human command sets heading)
+    yaws_np = np.arctan2(
+        [ep.human_dir[1] for ep in episodes],
+        [ep.human_dir[0] for ep in episodes])
+    c_y = np.cos(yaws_np); s_y = np.sin(yaws_np)
+    R_np = np.stack([np.stack([ c_y, -s_y], axis=1),
+                     np.stack([ s_y,  c_y], axis=1)], axis=1)      # (B, 2, 2)
+    R_t  = torch.tensor(R_np, dtype=torch.float32, device=device)  # constant
+
+    # u_perf in body frame for α-net feature (R^T @ u_world)
+    u_perf_body_t = torch.einsum(
+        'bij,bj->bi', R_t.transpose(1, 2), u_perf_world_t)         # (B, 2)
+    u_exp = u_perf_body_t.unsqueeze(1).expand(-1, n_obs, -1)       # (B, n_obs, 2)
+
+    # CBF shape matrix Q = I/(a+r)² — yaw-independent, computed once
+    r_np = radii.detach().cpu().numpy()
+    a    = ROBOT_HALF_LENGTH
+    la   = 1.0 / (a + r_np) ** 2
+    Q_np = np.zeros((*r_np.shape, 2, 2))
+    Q_np[..., 0, 0] = la
+    Q_np[..., 1, 1] = la
+    Q_t  = torch.tensor(Q_np, dtype=torch.float32, device=device)  # (B, n_obs, 2, 2)
+
+    # Normalise by squared path length so loss is dimensionless
+    path_length_sq = (v_humans * _T * _DT) ** 2                    # (B,)
+    path_length_sq = path_length_sq.clamp(min=1e-3)
+
+    # Human's starting position (same as robot start, no gradient needed)
+    human_start = pos.detach().clone()                              # (B, 2)
+
+    # Perpendicular to human direction — lateral deviation is α-dependent.
+    # Forward deviation (robot falling behind) is α-independent: the robot
+    # always moves at v_max, just sideways during avoidance.  Including the
+    # forward component adds noise without gradient signal.
+    perp_t = torch.stack(
+        [-human_dirs[:, 1], human_dirs[:, 0]], dim=1)              # (B, 2)
+
+    # Normalise by half-path-length squared: at the midpoint a 1 m lateral
+    # deviation gives loss ≈ 1.  Keeps loss magnitude interpretable.
+    lat_norm_sq = (v_humans * _T * _DT / 2.0) ** 2                 # (B,)
+    lat_norm_sq = lat_norm_sq.clamp(min=1e-3)
+
+    loss = torch.zeros(1, device=device)
+
+    for t in range(_T):
+        # Human position at end of this step (for loss) and start (for feature)
+        human_pos_t   = (human_start
+                         + (t + 1) * _DT * u_perf_world_t.detach()) # (B, 2)
+        human_pos_now = (human_start
+                         + t * _DT * u_perf_world_t.detach())       # (B, 2)
+
+        # ── CBF gradients ─────────────────────────────────────────────────
+        pos_np   = pos.detach().cpu().numpy()
+        d_obs_np = (pos_np[:, np.newaxis, :]
+                    - centers.detach().cpu().numpy())
+        A_cbf_np = 2.0 * np.einsum('bnij,bnj->bni', Q_np, d_obs_np)
+        A_cbf_t  = torch.tensor(A_cbf_np, dtype=torch.float32, device=device)
+
+        # ── α-net features (relative body frame) ─────────────────────────
+        pos_det       = pos.detach()
+
+        d_to_obs_w    = centers - pos_det.unsqueeze(1)             # (B, n_obs, 2)
+        d_to_obs_body = torch.einsum(
+            'bji,bnj->bni', R_t, d_to_obs_w)                      # (B, n_obs, 2)
+
+        d_now_det = pos_det.unsqueeze(1) - centers
+        h_feat    = (torch.einsum('bni,bnij,bnj->bn',
+                                  d_now_det, Q_t, d_now_det) - 1.0
+                     ).unsqueeze(-1)                               # (B, n_obs, 1)
+
+        # d_to_human in body frame — dynamic lateral-deviation signal
+        d_to_human_w   = human_pos_now - pos_det                  # (B, 2)
+        d_to_human_b   = torch.einsum(
+            'bji,bj->bi', R_t, d_to_human_w)                     # (B, 2)
+        d_to_human_exp = d_to_human_b.unsqueeze(1).expand(
+            -1, n_obs, -1)                                        # (B, n_obs, 2)
+
+        feat = AlphaNet.build_input(
+            d_to_obs_body = d_to_obs_body,
+            r             = radii.unsqueeze(-1),
+            h             = h_feat,
+            u_perf        = u_exp,
+            d_to_goal     = d_to_human_exp,
+        ).reshape(B * n_obs, AlphaNet.INPUT_DIM)
+
+        alphas_flat = alpha_net(feat).reshape(B, n_obs)            # (B, n_obs)
+
+        # ── QP RHS ────────────────────────────────────────────────────────
+        d_now   = pos.unsqueeze(1) - centers
+        h_now   = (torch.einsum('bni,bnij,bnj->bn', d_now, Q_t, d_now)
+                   - 1.0)                                          # (B, n_obs)
+        b_cbf_t = -alphas_flat * h_now
+
+        # ── Solve CBF-QP ──────────────────────────────────────────────────
+        u_safe_world = cbf_qp.solve_differentiable_batch(
+            u_perf_world_t, A_cbf_t, b_cbf_t)                     # (B, 2)
+
+        # ── Integrate ─────────────────────────────────────────────────────
+        pos = pos + u_safe_world * _DT
+
+        # ── Lateral-only teleop loss, gated on CBF activity ───────────────
+        #
+        # Option 2: only count steps where at least one obstacle is active
+        # (h < _H_ACTIVE).  Steps far from all obstacles contribute zero
+        # α-gradient — excluding them removes uninformative noise from the
+        # gradient.
+        #
+        # Option 3: lateral deviation only — project (pos − human_pos) onto
+        # perp (perpendicular to human walking direction).  The forward
+        # component is α-independent (robot and human both walk at v_max
+        # along the path); only the lateral push-away is α-dependent.
+        #
+        # Together these two changes make the gradient signal tight:
+        # every term in the sum is both (a) near an obstacle and (b) measures
+        # only the α-dependent component of deviation.
+
+        # ── Lateral-only teleop loss ──────────────────────────────────────────
+        # Project (pos − human_pos) onto perp (perpendicular to human dir).
+        # Forward deviation is α-independent; lateral push-away is α-dependent.
+        lat_dev = ((pos - human_pos_t) * perp_t).sum(dim=1)        # (B,)
+        per_ep  = lat_dev ** 2 / lat_norm_sq
+        loss    = loss + torch.sum(per_ep)
+
+        # ── Safety penalty ────────────────────────────────────────────────────
+        _H_MARGIN = 0.05
+        d_obs  = pos.unsqueeze(1) - centers
+        h_vals = (torch.einsum('bni,bnij,bnj->bn', d_obs, Q_t, d_obs) - 1.0)
+        viol   = _SLACK_WEIGHT_TELEOP * torch.sum(
+            torch.relu(_H_MARGIN - h_vals) ** 2, dim=1) / lat_norm_sq
+        loss   = loss + torch.sum(viol)
+
+    return loss / B
+
+
 # ── Main training loop ────────────────────────────────────────────────────────
 
 def train(
@@ -249,6 +435,7 @@ def train(
     checkpoint_dir: str   = _CHECKPOINT_DIR,
     out_name:       str   = 'alpha_net.pth',
     resume:         str   = '',
+    teleop:         bool  = False,
 ) -> AlphaNet:
     """
     Train the α-net and return the trained model.
@@ -264,6 +451,8 @@ def train(
     resume         : path to a checkpoint to warm-restart from; the LR
                      schedule is reset to its initial value so training
                      continues with full step sizes from the loaded weights
+    teleop         : if True, use teleop loss (deviation from moving human)
+                     instead of static goal-reaching loss
     """
     assert n_obstacles <= _MAX_OBSTACLES, (
         f"n_obstacles={n_obstacles} exceeds _MAX_OBSTACLES={_MAX_OBSTACLES}. "
@@ -283,16 +472,21 @@ def train(
 
     os.makedirs(checkpoint_dir, exist_ok=True)
 
+    mode_str = "teleop" if teleop else "goal-reaching"
     print(f"Training α-net  |  device={device}  iters={n_iters}  "
-          f"envs/iter={n_envs}  obstacles={n_obstacles}  T={_T}  dt={_DT}s")
+          f"envs/iter={n_envs}  obstacles={n_obstacles}  T={_T}  dt={_DT}s"
+          f"  mode={mode_str}")
     print(f"{'Iter':>6}  {'Loss (mean)':>12}  {'Min h (safety)':>16}")
     print("-" * 42)
+
+    _sample  = sample_teleop_episode if teleop else sample_episode
+    _rollout = _rollout_batch_teleop  if teleop else _rollout_batch
 
     for it in range(n_iters):
         optimizer.zero_grad()
 
-        episodes  = [sample_episode(n_obstacles=n_obstacles) for _ in range(n_envs)]
-        mean_loss = _rollout_batch(alpha_net, cbf_qp, episodes, device)
+        episodes  = [_sample(n_obstacles=n_obstacles) for _ in range(n_envs)]
+        mean_loss = _rollout(alpha_net, cbf_qp, episodes, device)
         mean_loss.backward()
         # Raised from 1.0: full BPTT through h_now produces larger gradient
         # norms; clipping too aggressively at 1.0 crushes the signal.
@@ -303,7 +497,8 @@ def train(
         # ── Logging ───────────────────────────────────────────────────────
         if it % 10 == 0 or it == n_iters - 1:
             min_h = _eval_min_cbf(alpha_net, cbf_qp, n_eval=50,
-                                  n_obstacles=n_obstacles, device=device)
+                                  n_obstacles=n_obstacles, teleop=teleop,
+                                  device=device)
             print(f"{it:>6}  {mean_loss.item():>12.3f}  {min_h:>16.4f}"
                   f"   lr={scheduler.get_last_lr()[0]:.2e}")
 
@@ -328,6 +523,7 @@ def _eval_min_cbf(
     cbf_qp:      CBFQP,
     n_eval:      int          = 20,
     n_obstacles: int          = 1,
+    teleop:      bool         = False,
     device:      torch.device = torch.device('cpu'),
 ) -> float:
     """
@@ -339,49 +535,59 @@ def _eval_min_cbf(
     pd_eval = PDController(kp=1.5, v_max=1.5)
     sim     = KinematicSim(dt=_DT)
     min_h   = float('inf')
+    _sample = sample_teleop_episode if teleop else sample_episode
 
     for _ in range(n_eval):
-        episode = sample_episode(n_obstacles=n_obstacles)
+        episode  = _sample(n_obstacles=n_obstacles)
         sim.reset(episode.start)
+        human_pos = episode.start.copy()
 
-        for _ in range(_T):
-            pos_np  = sim.pos
-            yaw     = sim.heading_toward(episode.goal)
-            sim.yaw = yaw
+        for step in range(_T):
+            pos_np = sim.pos
 
-            c, s = np.cos(yaw), np.sin(yaw)
-            R = np.array([[c, -s], [s, c]])   # body → world; R^T is world → body
+            if teleop:
+                yaw = float(np.arctan2(episode.human_dir[1], episode.human_dir[0]))
+                sim.yaw = yaw   # must be set so sim.step() rotates u correctly
+                c, s = np.cos(yaw), np.sin(yaw)
+                R    = np.array([[c, -s], [s, c]])
+                u_perf_np  = world_to_body(
+                    episode.v_human * episode.human_dir, yaw)   # body frame
+                human_pos  = episode.start + step * _DT * episode.v_human * episode.human_dir
+                d_to_ref   = R.T @ (human_pos - pos_np)
+            else:
+                yaw = sim.heading_toward(episode.goal)
+                sim.yaw = yaw
+                c, s = np.cos(yaw), np.sin(yaw)
+                R    = np.array([[c, -s], [s, c]])
+                u_perf_np = pd_eval(pos_np, episode.goal, yaw)
+                d_to_ref  = R.T @ (episode.goal - pos_np)
 
-            u_perf_np = pd_eval(pos_np, episode.goal, yaw)
-            u_perf_t  = torch.tensor(u_perf_np, dtype=torch.float32, device=device)
-
-            # d_to_goal in body frame — same for all obstacles this step
-            d_to_goal_body = torch.tensor(
-                R.T @ (episode.goal - pos_np), dtype=torch.float32, device=device)
+            # u_perf_np is already in body frame
+            u_perf_t = torch.tensor(u_perf_np, dtype=torch.float32, device=device)
+            d_to_ref_t = torch.tensor(d_to_ref, dtype=torch.float32, device=device)
 
             alphas: List[float] = []
             for obs in episode.obstacles:
-                a_half = ROBOT_HALF_LENGTH
-                d_w    = obs.center - pos_np                               # world frame
-                d_to_obs_body = R.T @ d_w                                  # body frame
-                h_val  = float(np.dot(d_w, d_w) / (a_half + obs.radius)**2 - 1.0)
+                d_w           = obs.center - pos_np
+                d_to_obs_body = R.T @ d_w
+                h_val         = float(
+                    np.dot(d_w, d_w) / (ROBOT_HALF_LENGTH + obs.radius)**2 - 1.0)
 
                 feat = AlphaNet.build_input(
-                    d_to_obs_body = torch.tensor(d_to_obs_body, dtype=torch.float32, device=device),
-                    r             = torch.tensor([obs.radius],  dtype=torch.float32, device=device),
-                    h             = torch.tensor([h_val],       dtype=torch.float32, device=device),
+                    d_to_obs_body = torch.tensor(
+                        d_to_obs_body, dtype=torch.float32, device=device),
+                    r             = torch.tensor(
+                        [obs.radius], dtype=torch.float32, device=device),
+                    h             = torch.tensor(
+                        [h_val],     dtype=torch.float32, device=device),
                     u_perf        = u_perf_t,
-                    d_to_goal     = d_to_goal_body,
+                    d_to_goal     = d_to_ref_t,
                 )
                 alphas.append(float(alpha_net(feat).cpu().item()))
 
             u_safe_np = cbf_qp.solve_fast(
-                u_perf_body = u_perf_np,
-                obstacles   = episode.obstacles,
-                p_robot     = pos_np,
-                yaw         = yaw,
-                alphas      = alphas,
-            )
+                u_perf_body=u_perf_np, obstacles=episode.obstacles,
+                p_robot=pos_np, yaw=yaw, alphas=alphas)
             sim.step(u_safe_np)
 
             for obs in episode.obstacles:
@@ -393,18 +599,23 @@ def _eval_min_cbf(
 # ── Baseline comparison ───────────────────────────────────────────────────────
 
 def evaluate(
-    model_path:  str,
-    n_eval:      int = 500,
-    n_obstacles: int = 1,
+    model_path:     str,
+    n_eval:         int  = 500,
+    n_obstacles:    int  = 1,
+    slalom_only:    bool = False,
+    corridor_only:  bool = False,
+    teleop:         bool = False,
 ) -> None:
     """
     Compare the learned α-net against fixed-α baselines.
 
     Reports per-policy:
-      mean_loss  — average normalised trajectory cost (lower = faster to goal)
-      min_h      — minimum CBF value seen across all episodes (negative = collision)
+      mean_loss  — average normalised trajectory cost
+                   goal-reaching: Σ‖pos−goal‖²/dist0²
+                   teleop:        Σ‖pos−human_pos(t)‖²/path_length²
+      min_h      — minimum CBF value seen (negative = collision)
       coll_rate  — fraction of episodes with at least one h < 0 step
-      mean_alpha — average α the learned net outputs (for diagnosing aggression)
+      mean_alpha — average α output (for diagnosing aggression)
     """
     from mocap_teleop.ctrl.simulator import KinematicSim
 
@@ -417,44 +628,78 @@ def evaluate(
     sim     = KinematicSim(dt=_DT)
 
     # Pre-sample episodes so every policy sees the same scenarios
-    episodes = [sample_episode(n_obstacles=n_obstacles) for _ in range(n_eval)]
+    if teleop:
+        episodes = [sample_teleop_episode(n_obstacles=n_obstacles)
+                    for _ in range(n_eval)]
+    else:
+        episodes = [sample_episode(n_obstacles=n_obstacles,
+                                   force_slalom=slalom_only,
+                                   force_corridor=corridor_only)
+                    for _ in range(n_eval)]
 
     def _run_policy(alpha_fn):
-        """alpha_fn(pos_np, yaw, R, obs, u_perf_t) → float"""
-        total_loss  = 0.0
+        """alpha_fn(pos_np, yaw, R, obs, u_perf_body_np, ref_body) → float"""
+        total_loss   = 0.0
         global_min_h = float('inf')
         n_collisions = 0
-        alpha_values = []
+        alpha_by_idx: dict = {}
 
         for ep in episodes:
             sim.reset(ep.start)
-            dist0_sq = float(np.sum((ep.start - ep.goal) ** 2))
-            dist0_sq = max(dist0_sq, 1e-3)
+
+            if teleop:
+                norm_sq = max((ep.v_human * _T * _DT) ** 2, 1e-3)
+            else:
+                norm_sq = max(float(np.sum((ep.start - ep.goal) ** 2)), 1e-3)
+
             ep_loss  = 0.0
             ep_min_h = float('inf')
 
-            for _ in range(_T):
+            for step in range(_T):
                 pos_np = sim.pos
-                yaw    = sim.heading_toward(ep.goal)
-                sim.yaw = yaw
-                c, s   = np.cos(yaw), np.sin(yaw)
-                R      = np.array([[c, -s], [s, c]])
 
-                u_perf_np = pd_eval(pos_np, ep.goal, yaw)
-                u_perf_t  = torch.tensor(u_perf_np, dtype=torch.float32, device=device)
+                if teleop:
+                    yaw = float(np.arctan2(ep.human_dir[1], ep.human_dir[0]))
+                    sim.yaw = yaw   # must be set so sim.step() rotates u correctly
+                    c, s = np.cos(yaw), np.sin(yaw)
+                    R    = np.array([[c, -s], [s, c]])
+                    u_perf_np = world_to_body(
+                        ep.v_human * ep.human_dir, yaw)        # body frame
+                    human_pos = (ep.start
+                                 + step * _DT * ep.v_human * ep.human_dir)
+                    ref_body  = R.T @ (human_pos - pos_np)     # d_to_human
+                else:
+                    yaw = sim.heading_toward(ep.goal)
+                    sim.yaw = yaw
+                    c, s = np.cos(yaw), np.sin(yaw)
+                    R    = np.array([[c, -s], [s, c]])
+                    u_perf_np = pd_eval(pos_np, ep.goal, yaw)  # body frame
+                    ref_body  = R.T @ (ep.goal - pos_np)       # d_to_goal
+
+                u_perf_t  = torch.tensor(
+                    u_perf_np, dtype=torch.float32, device=device)
 
                 alphas = []
-                for obs in ep.obstacles:
-                    a_val = alpha_fn(pos_np, yaw, R, obs, u_perf_t, ep.goal)
+                for k, obs in enumerate(ep.obstacles):
+                    a_val = alpha_fn(pos_np, yaw, R, obs, u_perf_t, ref_body)
                     alphas.append(a_val)
-                    alpha_values.append(a_val)
+                    alpha_by_idx.setdefault(k, []).append(a_val)
 
                 u_safe_np = cbf_qp.solve_fast(
                     u_perf_body=u_perf_np, obstacles=ep.obstacles,
                     p_robot=pos_np, yaw=yaw, alphas=alphas)
                 sim.step(u_safe_np)
 
-                ep_loss += float(np.sum((sim.pos - ep.goal) ** 2)) / dist0_sq
+                if teleop:
+                    human_pos_next = (ep.start
+                                      + (step + 1) * _DT
+                                      * ep.v_human * ep.human_dir)
+                    ep_loss += float(
+                        np.sum((sim.pos - human_pos_next) ** 2)) / norm_sq
+                else:
+                    ep_loss += float(
+                        np.sum((sim.pos - ep.goal) ** 2)) / norm_sq
+
                 for obs in ep.obstacles:
                     ep_min_h = min(ep_min_h, sim.cbf_value(obs))
 
@@ -465,37 +710,52 @@ def evaluate(
 
         mean_loss  = total_loss / n_eval
         coll_rate  = n_collisions / n_eval
-        mean_alpha = float(np.mean(alpha_values)) if alpha_values else float('nan')
-        return mean_loss, global_min_h, coll_rate, mean_alpha
+        all_alphas = [a for vals in alpha_by_idx.values() for a in vals]
+        mean_alpha = float(np.mean(all_alphas)) if all_alphas else float('nan')
+        std_alpha  = float(np.std(all_alphas))  if all_alphas else float('nan')
+        per_obs    = {k: float(np.mean(v))
+                      for k, v in sorted(alpha_by_idx.items())}
+        return mean_loss, global_min_h, coll_rate, mean_alpha, std_alpha, per_obs
 
     # ── Learned α ─────────────────────────────────────────────────────────────
     @torch.no_grad()
-    def learned_alpha(pos_np, _yaw, R, obs, u_perf_t, goal):
+    def learned_alpha(pos_np, _yaw, R, obs, u_perf_t, ref_body):
         d_w           = obs.center - pos_np
         d_to_obs_body = R.T @ d_w
-        h_val         = float(np.dot(d_w, d_w) / (ROBOT_HALF_LENGTH + obs.radius)**2 - 1.0)
-        d_to_goal_b   = R.T @ (goal - pos_np)
+        h_val         = float(
+            np.dot(d_w, d_w) / (ROBOT_HALF_LENGTH + obs.radius)**2 - 1.0)
         feat = AlphaNet.build_input(
-            d_to_obs_body = torch.tensor(d_to_obs_body, dtype=torch.float32, device=device),
-            r             = torch.tensor([obs.radius],  dtype=torch.float32, device=device),
-            h             = torch.tensor([h_val],       dtype=torch.float32, device=device),
+            d_to_obs_body = torch.tensor(
+                d_to_obs_body, dtype=torch.float32, device=device),
+            r             = torch.tensor(
+                [obs.radius], dtype=torch.float32, device=device),
+            h             = torch.tensor(
+                [h_val],     dtype=torch.float32, device=device),
             u_perf        = u_perf_t,
-            d_to_goal     = torch.tensor(d_to_goal_b,  dtype=torch.float32, device=device),
+            d_to_goal     = torch.tensor(
+                ref_body,   dtype=torch.float32, device=device),
         )
         return float(alpha_net(feat).cpu().item())
 
-    print(f"\nEvaluating on {n_eval} episodes  (obstacles={n_obstacles})\n")
-    print(f"{'Policy':<18}  {'Mean loss':>10}  {'Min h':>8}  {'Coll%':>7}  {'Mean α':>8}")
-    print("-" * 58)
+    mode_str = "teleop" if teleop else "goal-reaching"
+    print(f"\nEvaluating on {n_eval} episodes  "
+          f"(obstacles={n_obstacles}  mode={mode_str})\n")
+    print(f"{'Policy':<18}  {'Mean loss':>10}  {'Min h':>8}  {'Coll%':>7}"
+          f"  {'Mean α':>8}  {'Std α':>7}  Per-obstacle α")
+    print("-" * 80)
 
-    loss, min_h, coll, mean_a = _run_policy(learned_alpha)
-    print(f"{'learned α':<18}  {loss:>10.3f}  {min_h:>8.4f}  {coll*100:>6.1f}%  {mean_a:>8.3f}")
+    loss, min_h, coll, mean_a, std_a, per_obs = _run_policy(learned_alpha)
+    per_str = "  ".join(f"obs{k}={v:.2f}" for k, v in per_obs.items())
+    print(f"{'learned α':<18}  {loss:>10.3f}  {min_h:>8.4f}  {coll*100:>6.1f}%"
+          f"  {mean_a:>8.3f}  {std_a:>7.3f}  {per_str}")
 
-    for fixed_a in [0.5, 1.0, 2.0, 5.0]:
-        def fixed_alpha(pos_np, yaw, R, obs, u_perf_t, goal, a=fixed_a):
+    for fixed_a in [0.5, 1.0, 2.0, 5.0, 8.0, 10.0]:
+        def fixed_alpha(*_, a=fixed_a):
             return a
-        loss, min_h, coll, mean_a = _run_policy(fixed_alpha)
-        print(f"{'fixed α='+str(fixed_a):<18}  {loss:>10.3f}  {min_h:>8.4f}  {coll*100:>6.1f}%  {mean_a:>8.3f}")
+        loss, min_h, coll, mean_a, std_a, per_obs = _run_policy(fixed_alpha)
+        per_str = "  ".join(f"obs{k}={v:.2f}" for k, v in per_obs.items())
+        print(f"{'fixed α='+str(fixed_a):<18}  {loss:>10.3f}  {min_h:>8.4f}  "
+              f"{coll*100:>6.1f}%  {mean_a:>8.3f}  {std_a:>7.3f}  {per_str}")
 
 
 # ── CLI entry point ───────────────────────────────────────────────────────────
@@ -514,13 +774,21 @@ def main():
     tr.add_argument('--ckpt-dir',  type=str,   default=_CHECKPOINT_DIR)
     tr.add_argument('--resume',    type=str,   default='',
                     help='checkpoint for warm restart (weights loaded, LR reset)')
+    tr.add_argument('--teleop',    action='store_true',
+                    help='train with teleop loss (deviation from moving human)')
 
     # ── eval subcommand ───────────────────────────────────────────────────────
     ev = sub.add_parser('eval', help='compare learned α against fixed-α baselines')
-    ev.add_argument('model',       type=str,
+    ev.add_argument('model',          type=str,
                     help='path to saved α-net checkpoint (e.g. alpha_net_v2.pth)')
-    ev.add_argument('--episodes',  type=int,   default=500)
-    ev.add_argument('--obstacles', type=int,   default=1)
+    ev.add_argument('--episodes',     type=int,            default=500)
+    ev.add_argument('--obstacles',    type=int,            default=1)
+    ev.add_argument('--slalom-only',   action='store_true',
+                    help='evaluate on slalom/corridor mix only')
+    ev.add_argument('--corridor-only', action='store_true',
+                    help='evaluate on corridor episodes only')
+    ev.add_argument('--teleop',        action='store_true',
+                    help='evaluate with teleop loss (deviation from moving human)')
 
     # ── fallback: no subcommand → train with old-style flat args ─────────────
     parser.add_argument('--iters',     type=int,   default=_N_ITERS)
@@ -533,7 +801,9 @@ def main():
     args = parser.parse_args()
 
     if args.cmd == 'eval':
-        evaluate(args.model, n_eval=args.episodes, n_obstacles=args.obstacles)
+        evaluate(args.model, n_eval=args.episodes, n_obstacles=args.obstacles,
+                 slalom_only=args.slalom_only, corridor_only=args.corridor_only,
+                 teleop=args.teleop)
     else:
         train(
             n_iters        = args.iters,
@@ -543,6 +813,7 @@ def main():
             checkpoint_dir = args.ckpt_dir,
             out_name       = args.out,
             resume         = args.resume,
+            teleop         = getattr(args, 'teleop', False),
         )
 
 
