@@ -61,7 +61,7 @@ _MIN_SG_DIST    = 1.0     # minimum start-goal distance (m)
 _N_ITERS        = 150     # training iterations
 _N_ENVS         = 30      # environments sampled per iteration
 _LR             = 3e-4    # Adam learning rate
-_SLACK_WEIGHT        = 100.0   # λ_δ — penalty for CBF constraint violations (goal mode)
+_SLACK_WEIGHT        = 1000.0  # λ_δ — penalty for CBF constraint violations (goal mode)
 _SLACK_WEIGHT_TELEOP = 500.0   # higher because path_length_sq ≈ 56 >> typical dist0_sq ≈ 9
 _CHECKPOINT_DIR = '.'     # directory to save checkpoints
 
@@ -242,7 +242,7 @@ def _rollout_batch(
         # Divided by n_obs so the penalty stays the same magnitude regardless
         # of obstacle count — without this, 2 obstacles → 2× safety gradient,
         # which overpowers the performance gradient and stalls learning.
-        _H_MARGIN = 0.05
+        _H_MARGIN = 0.10   # raised: penalise closer approaches before h goes negative
         Q_t    = torch.tensor(Q_np, dtype=torch.float32, device=device) # (B,n_obs,2,2)
         d_obs  = pos.unsqueeze(1) - centers                              # (B,n_obs,2)
         h_vals = torch.einsum('bni,bnij,bnj->bn', d_obs, Q_t, d_obs) - 1.0
@@ -435,7 +435,7 @@ def _rollout_batch_teleop(
         loss    = loss + torch.sum(per_ep)
 
         # ── Safety penalty (normalised by n_obs) ─────────────────────────────
-        _H_MARGIN = 0.05
+        _H_MARGIN = 0.10
         d_obs  = pos.unsqueeze(1) - centers
         h_vals = (torch.einsum('bni,bnij,bnj->bn', d_obs, Q_t, d_obs) - 1.0)
         viol   = (_SLACK_WEIGHT_TELEOP / n_obs) * torch.sum(
