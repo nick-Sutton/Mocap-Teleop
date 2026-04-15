@@ -1,0 +1,80 @@
+================================================================================
+TELEOP PERFORMANCE METRICS SUMMARY
+================================================================================
+
+OVERALL:
+----------------------------------------
+  Duration:          69.02 s
+  Frames:            16564
+  Gait transitions:  23
+
+POSITION:
+----------------------------------------
+  Mean ± Std:  40.74 ± 32.88 cm
+  RMSE:        52.36 cm
+  Median:      30.50 cm
+  Max:         133.11 cm
+  ≤ 5 cm:      5.0%
+  ≤ 10 cm:     11.8%
+  ≤ 20 cm:     30.5%
+
+VELOCITY:
+----------------------------------------
+  Mean ± Std:  0.752 ± 4.513 m/s
+  RMSE:        4.575 m/s
+  ≤ 0.1 m/s:   5.8%
+  ≤ 0.2 m/s:   15.7%
+
+HEADING:
+----------------------------------------
+  Mean ± Std:  26.93 ± 25.73°
+  RMSE:        37.25°
+  ≤ 5°:        7.4%
+  ≤ 10°:       19.3%
+
+PER-GAIT:
+----------------------------------------
+  STAND (8.9s, 2146 frames)
+    Pos RMSE: 51.26 cm  Vel RMSE: 0.400 m/s  Head RMSE: 45.24°
+    ≤10cm: 21.9%
+  WALK (45.1s, 10817 frames)
+    Pos RMSE: 54.87 cm  Vel RMSE: 0.729 m/s  Head RMSE: 26.22°
+    ≤10cm: 6.7%
+  JOG (15.0s, 3601 frames)
+    Pos RMSE: 44.74 cm  Vel RMSE: 9.726 m/s  Head RMSE: 55.66°
+    ≤10cm: 21.1%
+
+TRANSITIONS:
+----------------------------------------
+  t=2.15s: stand → walk
+  t=4.67s: walk → jog
+  t=5.67s: jog → walk
+  t=7.48s: walk → stand
+  t=8.48s: stand → walk
+  t=9.80s: walk → stand
+  t=10.80s: stand → jog
+  t=12.42s: jog → walk
+  t=16.65s: walk → jog
+  t=17.97s: jog → walk
+  t=21.64s: walk → stand
+  t=22.64s: stand → walk
+  t=23.64s: walk → jog
+  t=26.79s: jog → stand
+  t=27.79s: stand → walk
+  t=31.84s: walk → jog
+  t=32.85s: jog → walk
+  t=34.96s: walk → stand
+  t=35.96s: stand → walk
+  t=36.96s: walk → jog
+  t=37.96s: jog → walk
+  t=41.02s: walk → jog
+  t=42.02s: jog → walk
+
+COMPONENT FREQUENCY:
+----------------------------------------
+  Samples logged: 47  (over 47.0 s)
+  Mocap        nominal=240 Hz  mean=239.9  std=0.5  min=237.1  max=241.2  within±5%=100.0%
+  Classifier   nominal=20 Hz  mean=19.3  std=1.8  min=9.6  max=19.9  within±5%=87.2%
+  PD Ctrl      nominal=500 Hz  mean=355.6  std=36.8  min=119.3  max=414.8  within±5%=0.0%
+
+================================================================================

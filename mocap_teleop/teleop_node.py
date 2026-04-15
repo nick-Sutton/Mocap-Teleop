@@ -18,7 +18,8 @@ Buffer-fill thread — Python thread: polls _new_mocap_frame at 1 kHz, runs
 Classifier thread  — Python thread: calls gc.infer() at ~13 Hz (capped by the
                      75ms TCN forward pass).  Sets _gait_prediction for PD.
 
-PD thread          — Python thread at 1000 Hz using time.sleep().
+PD thread          — Python thread at 500 Hz using time.sleep().
+                     (Loop body ~2 ms; 1 kHz target was unachievable.)
 """
 
 import os
@@ -30,7 +31,7 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.executors import SingleThreadedExecutor, ExternalShutdownException
-from geometry_msgs.msg import Twist, PoseStamped
+from geometry_msgs.msg import Twist, TwistStamped, PoseStamped
 from std_msgs.msg import String, Bool
 from visualization_msgs.msg import MarkerArray
 
@@ -45,7 +46,7 @@ from mocap_teleop.util.freq_meter import FrequencyMeter
 from mocap_teleop.util.performance_metrics import PerformanceMetrics
 import mocap_teleop.util.io_parser as io
 
-_PD_RATE_HZ          = 1000.0
+_PD_RATE_HZ          = 500.0    # loop body ~2 ms → reliable at 500 Hz
 _CLASSIFIER_RATE_HZ  = 20.0     # cap at realistic CPU inference rate
 _LOG_RATE_HZ         = 1.0
 _MOCAP_TIMEOUT_S     = 0.5      # stop robot if no mocap for 500 ms
@@ -271,8 +272,7 @@ class TeleopNode(Node):
                         CtrlInterface.walk(vx=0, vy=0, vrz=0)
                     else:
                         try:
-                            pos  = CtrlInterface.get_robot_position()
-                            quat = CtrlInterface.get_robot_orientation()
+                            pos, quat = CtrlInterface.get_robot_pose()
                             _telemetry_warned = False
                         except Exception as e:
                             if not _telemetry_warned:
@@ -299,6 +299,7 @@ class TeleopNode(Node):
                                 confidence      = self._gait_confidence,
                                 robot_pose      = robot_pose,
                                 root_pose       = self._latest_human_state.root_pose,
+                                root_twist      = self._latest_human_state.root_twist,
                             )
 
                             # ── CBF safety filter ─────────────────────────────
@@ -329,10 +330,23 @@ class TeleopNode(Node):
                                 vrz = float(cmd_vel[2]),
                             )
 
+                            # Rotate commanded body velocity to world frame for
+                            # the velocity tracking metric.  Uses the commanded
+                            # (post-CBF) velocity as a proxy for actual robot vel.
+                            _yaw = np.arctan2(
+                                2.0 * (quat[3] * quat[2] + quat[0] * quat[1]),
+                                1.0 - 2.0 * (quat[1]**2 + quat[2]**2))
+                            _c, _s = np.cos(_yaw), np.sin(_yaw)
+                            robot_twist_msg = TwistStamped()
+                            robot_twist_msg.twist.linear.x  = float(_c * vx_cmd - _s * vy_cmd)
+                            robot_twist_msg.twist.linear.y  = float(_s * vx_cmd + _c * vy_cmd)
+                            robot_twist_msg.twist.angular.z = float(cmd_vel[2])
+
                             self._metrics.log_frame(
                                 human_state = self._latest_human_state,
                                 robot_pose  = robot_pose,
-                                gait        = self._gait_prediction,
+                                robot_twist = robot_twist_msg,
+                                gait        = self.mapper.current_gait,
                             )
 
                             twist_msg           = Twist()

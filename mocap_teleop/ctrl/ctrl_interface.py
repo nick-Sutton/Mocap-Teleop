@@ -46,6 +46,21 @@ class CtrlInterface():
         return cmd.get_tlm_data()
 
     @staticmethod
+    def get_robot_pose():
+        """Get position and orientation in a single SDK call.
+
+        Returns
+        -------
+        position : array [x, y, z]
+        quat     : array [qx, qy, qz, qw]
+        """
+        tlm_data = cmd.get_tlm_data()
+        q = tlm_data[0]["q"] if isinstance(tlm_data, list) else tlm_data["q"]
+        position = q[:3]
+        quat = Rotation.from_euler("xyz", q[3:6]).as_quat()
+        return position, quat
+
+    @staticmethod
     def get_robot_orientation():
         """Get the robot's current orientation as quaternion"""
         tlm_data = cmd.get_tlm_data()

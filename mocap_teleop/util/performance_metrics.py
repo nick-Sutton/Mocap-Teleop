@@ -540,8 +540,9 @@ class PerformanceMetrics:
         h_disp = hpos - hpos[0]
         r_disp = rpos - rpos[0]
 
-        src_mag       = np.linalg.norm(h_disp, axis=1)
-        pct_err       = np.where(src_mag > 1e-6, (pos / src_mag) * 100, 0)
+        src_mag = np.linalg.norm(h_disp, axis=1)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            pct_err = np.where(src_mag > 1e-6, (pos / src_mag) * 100, 0)
 
         patches = _gait_legend_patches()
         fig, axes = plt.subplots(3, 2, figsize=(15, 12))

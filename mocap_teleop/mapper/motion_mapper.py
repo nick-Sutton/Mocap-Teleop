@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
 
 """
-motion_mapper.py — Proportional position-following controller for legged robot teleoperation.
+motion_mapper.py — PD position-following controller for legged robot teleoperation.
 
 Receives human state as ROS2 geometry_msgs types and robot odometry, outputs
 cmd_vel [vx_body, vy_body, vrz] in the robot's body frame.
 
 Control law
 ───────────
-Simple proportional control on the position error between human and robot,
-with velocity saturation:
+PD control on the position error between human and robot:
 
-    error_world = human_pos − robot_pos
-    cmd_world   = Kp * error_world,  clipped to MAX_LINEAR_VEL
-    cmd_body    = R(−yaw) * cmd_world
+    error_world  = human_pos − robot_pos
+    d_error/dt   = (error − prev_error) / dt  ≈ v_human − v_robot  (feedforward)
+    cmd_world    = Kp * error + Kd * d_error,  clipped to per-gait MAX_VEL
+    cmd_body     = R(−yaw) * cmd_world
 
-The velocity cap already provides the distance-dependent scaling that the
-previous adaptive-gain approach achieved with 12 tuning parameters:
-  far from human  → error large → cmd at v_max
-  close to human  → error small → cmd proportionally reduced → no oscillation
+The derivative term acts as velocity feedforward: when the human is moving at
+v_human m/s, d_error/dt ≈ v_human, so Kd * d_error adds a proportional
+anticipatory component that reduces lag at the cost of sensitivity to noise.
+
+Heading follows the same PD structure with independent gains.
 
 Coordinate frames
 ─────────────────
@@ -29,6 +30,8 @@ base_link   : robot body frame. cmd_vel is expressed in this frame.
 The one-time coordinate_offset aligns mocap_world origins with odom on
 the first call to select_robot_command.
 """
+
+import time
 
 import numpy as np
 from geometry_msgs.msg import PoseStamped
@@ -46,28 +49,68 @@ class MotionMapper:
         self.offset_initialized = False
 
         # ── Control gains ─────────────────────────────────────────────────────
-        # Kp: at POSITION_TOLERANCE the robot commands Kp * tolerance m/s.
-        # With Kp=1.0 and tolerance=0.05 m that's 0.05 m/s — effectively a stop.
-        # At 0.3 m error the robot commands 0.3 m/s = full speed.
-        self.Kp     = 1.0   # linear  (m/s per m of position error)
-        self.Kp_ang = 1.0   # angular (rad/s per rad of heading error)
+        # Kp:     proportional — at 0.5 m error commands 0.5 m/s before D term.
+        # Kd:     derivative   — adds velocity feedforward; Kd=0.3 means human
+        #         walking at 1.5 m/s contributes +0.45 m/s to the command.
+        # Kp_ang: angular proportional.
+        # Kd_ang: angular derivative — damps heading oscillation.
+        self.Kp     = 3.0   # m/s per m  — saturates to walk cap at ~0.43 m error
+        self.Kd     = 0.3   # m/s per m/s — velocity feedforward
+        self.Kp_ang = 1.5   # rad/s per rad
+        # Kd_ang is now a feedforward gain on the human's direct angular rate
+        # (from root_twist.angular.z) rather than a finite-difference derivative
+        # of heading error.  The overall loop remains feedback-controlled via
+        # Kp_ang; Kd_ang anticipates turns without differencing noisy error at
+        # 350 Hz.  Kd_ang≈0.5 injects half the human turn rate as anticipation;
+        # Kp_ang handles residual heading error.
+        self.Kd_ang         = 0.5   # rad/s per rad/s (human angular rate feedforward)
+        self.human_yaw_rate = 0.0   # rad/s, updated from root_twist.angular.z
 
         # ── Velocity limits ───────────────────────────────────────────────────
-        self.MAX_LINEAR_VEL  = 0.3   # m/s  — real Go2 vx limit
-        self.MAX_ANGULAR_VEL = 0.8   # rad/s
+        # MAX_LINEAR_VEL: absolute cap across all gaits; used by the CBF filter.
+        # MAX_VEL_BY_GAIT: per-gait cap applied inside compute_cmd_vel.
+        self.MAX_LINEAR_VEL  = 2.5   # m/s — Go2 jog ceiling
+        self.MAX_ANGULAR_VEL = 2.5   # rad/s — raised to track jogging turns
+        self.MAX_VEL_BY_GAIT = {
+            'stand': 1.0,   # enough to close gaps during brief stand phases
+            'walk':  1.5,   # above typical human walking speed (~1.2 m/s)
+            'jog':   2.5,   # Go2 jog ceiling
+        }
 
         # ── Dead-zones — suppress chatter when essentially co-located ─────────
         self.POSITION_TOLERANCE = 0.05          # m
         self.HEADING_TOLERANCE  = np.radians(5) # rad
 
-        # ── Gait scaling ──────────────────────────────────────────────────────
-        self.GAIT_VELOCITY_SCALES = {'stand': 0.0, 'walk': 1.0, 'jog': 1.0}
-        self.CONFIDENCE_THRESHOLD = 0.6
-        self.current_gait         = 'stand'
+        # ── Gait state ────────────────────────────────────────────────────────
+        self.CONFIDENCE_THRESHOLD   = 0.6
+        # Minimum time (s) before accepting a gait change — prevents rapid
+        # oscillation between gaits from a noisy classifier.
+        self.GAIT_DWELL_S           = 1.0
+        self.current_gait           = 'stand'
+        self._gait_last_change_time = 0.0
+
+        # ── Lookahead ─────────────────────────────────────────────────────────
+        # Target the human's predicted position T seconds ahead rather than
+        # their current position.  Directly compensates for the PD controller's
+        # inherent following lag during constant-velocity motion.
+        # Uses root_twist from the mocap driver (finite-differenced at 240 Hz)
+        # — cleaner than differentiating the position error ourselves.
+        self.LOOKAHEAD_S  = 0.2          # seconds; tune between 0.1–0.5
+        self.human_vel    = np.zeros(2)  # [vx, vy] world frame, updated each call
 
         # ── Internal state [x, y, yaw] ────────────────────────────────────────
         self.robot_pos = np.zeros(3)
         self.human_pos = np.zeros(3)
+
+        # ── Derivative state ──────────────────────────────────────────────────
+        # Initialised to None; set to current error on the first compute call
+        # so the D term is zero on the first frame (avoids a large spike).
+        # _last_compute_time tracks actual elapsed time for accurate derivatives
+        # regardless of loop jitter (nominal dt is unreliable at ~350 Hz actual).
+        self._prev_ex:           float | None = None
+        self._prev_ey:           float | None = None
+        self._last_compute_time: float | None = None
+
 
     # ── State updates ─────────────────────────────────────────────────────────
 
@@ -78,7 +121,8 @@ class MotionMapper:
         self.robot_pos[1] = p.y
         self.robot_pos[2] = self._quat_to_yaw(o.x, o.y, o.z, o.w)
 
-    def update_human_state(self, root_pose: PoseStamped) -> None:
+    def update_human_state(self, root_pose: PoseStamped,
+                           root_twist=None) -> None:
         p = root_pose.pose.position
         o = root_pose.pose.orientation
         human_yaw = self._quat_to_yaw(o.x, o.y, o.z, o.w)
@@ -93,11 +137,16 @@ class MotionMapper:
             self.human_pos[1] = p.y
             self.human_pos[2] = human_yaw
 
+        if root_twist is not None:
+            self.human_vel[0]   = root_twist.twist.linear.x
+            self.human_vel[1]   = root_twist.twist.linear.y
+            self.human_yaw_rate = root_twist.twist.angular.z
+
     # ── Control ───────────────────────────────────────────────────────────────
 
     def compute_cmd_vel(self):
         """
-        Proportional position-following controller.
+        PD position-following controller.
 
         Returns
         -------
@@ -105,29 +154,66 @@ class MotionMapper:
         distance_error : float  metres
         heading_error  : float  radians
         """
-        ex = self.human_pos[0] - self.robot_pos[0]
-        ey = self.human_pos[1] - self.robot_pos[1]
-        distance_error = np.hypot(ex, ey)
+        # ── Measure actual elapsed time for derivative accuracy ───────────────
+        # self.dt (nominal) is unreliable: the loop runs at ~350 Hz while the
+        # constructor receives 500 Hz, making the D term 44% too large if we use
+        # self.dt.  Using wall-clock elapsed time keeps gains correct under jitter.
+        now = time.monotonic()
+        actual_dt = (now - self._last_compute_time) if self._last_compute_time is not None else self.dt
+        actual_dt = max(actual_dt, 1e-4)   # guard against zero on first call
+        self._last_compute_time = now
+
+        # Lookahead: target where the human will be in LOOKAHEAD_S seconds.
+        # human_vel is the mocap-driver finite difference — cleaner than the
+        # D term derivative and requires no actual_dt accounting.
+        target_x = self.human_pos[0] + self.LOOKAHEAD_S * self.human_vel[0]
+        target_y = self.human_pos[1] + self.LOOKAHEAD_S * self.human_vel[1]
+
+        ex = target_x - self.robot_pos[0]
+        ey = target_y - self.robot_pos[1]
+        distance_error = np.hypot(self.human_pos[0] - self.robot_pos[0],
+                                  self.human_pos[1] - self.robot_pos[1])
         heading_error  = self._normalize_angle(
             self.human_pos[2] - self.robot_pos[2])
 
-        # Linear: P control with velocity saturation
+        # ── Linear PD ─────────────────────────────────────────────────────────
         if distance_error > self.POSITION_TOLERANCE:
-            vx_world = self.Kp * ex
-            vy_world = self.Kp * ey
-            speed    = np.hypot(vx_world, vy_world)
-            if speed > self.MAX_LINEAR_VEL:
-                scale    = self.MAX_LINEAR_VEL / speed
+            # Seed derivative state on first call so D term starts at zero.
+            if self._prev_ex is None:
+                self._prev_ex = ex
+                self._prev_ey = ey
+
+            d_ex = (ex - self._prev_ex) / actual_dt
+            d_ey = (ey - self._prev_ey) / actual_dt
+
+            vx_world = self.Kp * ex + self.Kd * d_ex
+            vy_world = self.Kp * ey + self.Kd * d_ey
+
+            speed   = np.hypot(vx_world, vy_world)
+            max_vel = self.MAX_VEL_BY_GAIT.get(self.current_gait,
+                                                self.MAX_LINEAR_VEL)
+            if max_vel <= 0.0:
+                vx_world = vy_world = 0.0
+            elif speed > max_vel:
+                scale    = max_vel / speed
                 vx_world *= scale
                 vy_world *= scale
         else:
-            vx_world = 0.0
-            vy_world = 0.0
+            vx_world = vy_world = 0.0
 
-        # Angular: P control with rate saturation
+        # Always advance derivative state so the next D term is well-conditioned
+        # regardless of whether the deadzone fired this step.
+        self._prev_ex = ex
+        self._prev_ey = ey
+
+        # ── Angular P + feedforward ───────────────────────────────────────────
+        # Kp_ang closes the feedback loop on heading error.
+        # Kd_ang * human_yaw_rate anticipates turns using the mocap angular
+        # rate directly — cleaner than differencing heading_error at 350 Hz.
         if abs(heading_error) > self.HEADING_TOLERANCE:
-            vrz = np.clip(self.Kp_ang * heading_error,
-                          -self.MAX_ANGULAR_VEL, self.MAX_ANGULAR_VEL)
+            vrz = np.clip(
+                self.Kp_ang * heading_error + self.Kd_ang * self.human_yaw_rate,
+                -self.MAX_ANGULAR_VEL, self.MAX_ANGULAR_VEL)
         else:
             vrz = 0.0
 
@@ -140,7 +226,10 @@ class MotionMapper:
         if confidence is None or confidence < self.CONFIDENCE_THRESHOLD:
             return self.current_gait
         if gait_prediction != self.current_gait:
-            self.current_gait = gait_prediction
+            now = time.monotonic()
+            if now - self._gait_last_change_time >= self.GAIT_DWELL_S:
+                self.current_gait           = gait_prediction
+                self._gait_last_change_time = now
         return self.current_gait
 
     def select_robot_command(
@@ -149,9 +238,10 @@ class MotionMapper:
         confidence:      float | None,
         robot_pose:      PoseStamped,
         root_pose:       PoseStamped,
+        root_twist=None,
     ) -> np.ndarray:
         """
-        Main control entry point — call at fixed rate (e.g. 1000 Hz).
+        Main control entry point — call at fixed rate (e.g. 500 Hz).
 
         Parameters
         ----------
@@ -165,27 +255,24 @@ class MotionMapper:
         cmd_vel : np.ndarray [vx_body, vy_body, vrz]
         """
         self.update_robot_state(robot_pose)
-        self.update_human_state(root_pose)
+        self.update_human_state(root_pose, root_twist)
 
         # One-time coordinate offset: align human frame origin with robot odom.
         # Use [:] assignment so PerformanceMetrics (which holds the same array) sees it.
+        # Yaw offset is intentionally zero: the robot should face the same absolute
+        # compass direction as the human at all times (teleportation model — if the
+        # human faces North, the robot faces North, independent of their starting headings).
         if not self.offset_initialized:
             self.coordinate_offset[:] = self.robot_pos - self.human_pos
+            self.coordinate_offset[2] = 0.0   # absolute heading alignment
             self.human_pos[0] += self.coordinate_offset[0]
             self.human_pos[1] += self.coordinate_offset[1]
             self.human_pos[2]  = self._normalize_angle(
                 self.human_pos[2] + self.coordinate_offset[2])
             self.offset_initialized = True
 
-        active_gait = self.select_gait(gait_prediction, confidence)
-        cmd_vel, distance_error, _ = self.compute_cmd_vel()
-
-        velocity_scale = self.GAIT_VELOCITY_SCALES[active_gait]
-        # Allow partial correction when standing but drifted
-        if active_gait == 'stand' and distance_error > self.POSITION_TOLERANCE:
-            velocity_scale = 0.5
-        cmd_vel *= velocity_scale
-
+        self.select_gait(gait_prediction, confidence)
+        cmd_vel, _, _ = self.compute_cmd_vel()
         return cmd_vel
 
     # ── Math helpers ──────────────────────────────────────────────────────────
