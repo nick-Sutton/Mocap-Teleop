@@ -1,8 +1,0 @@
-*.pyc
-*.aux
-*.log
-*.nav
-*.snm
-*.toc
-/build
-/data

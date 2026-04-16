@@ -18,8 +18,8 @@ command_port = 1510
 data_port = 1511
 
 [controller]
-controller_path = "~/repos/mpac/mpac_go2/"
-interface_subpath = "~/repos/mpac/mpac_go2/atnmy/"
+controller_path = "~/ros_ws/src/mocap_teleop/mpac_mujoco/mpac_go2/"
+interface_subpath = "~/ros_ws/src/mocap_teleop/mpac_mujoco/mpac_go2/atnmy/"
 
 [learning]
 gait_classifier_path = "ModelV1.pth"

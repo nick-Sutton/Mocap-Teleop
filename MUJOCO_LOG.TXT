@@ -1,0 +1,12 @@
+Wed Apr 15 23:19:29 2026
+WARNING: Nan, Inf or huge value in CTRL at ACTUATOR 0. The simulation is unstable. Time = 983.1070.
+
+Thu Apr 16 00:44:48 2026
+WARNING: Nan, Inf or huge value in CTRL at ACTUATOR 0. The simulation is unstable. Time = 2552.9090.
+
+Thu Apr 16 10:21:10 2026
+WARNING: OpenGL error 0x502 in or before mjr_makeContext
+
+Thu Apr 16 10:31:16 2026
+WARNING: OpenGL error 0x502 in or before mjr_makeContext
+

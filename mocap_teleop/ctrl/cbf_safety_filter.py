@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 
 """
-cbf_safety_filter.py — Learned CBF safety filter for deployment.
+cbf_safety_filter.py — AM-CBF safety filter for deployment.
 
 Sits between the motion mapper (u_perf) and the robot controller (CtrlInterface).
 At each control tick:
 
     1. Receive nominal command u_perf_body from MotionMapper
     2. Receive obstacle list from perception (world frame)
-    3. α-net predicts per-obstacle α from relative state features
-    4. OSQP solves the CBF-QP to find u_safe_body
-    5. Return u_safe_body — robot follows this instead of u_perf_body
+    3. κ-net evaluates κ(h_i) per obstacle from barrier value h_i
+    4. OSQP solves the CBF-QP:  ∇h_i · u  ≥  −κ(h_i)
+    5. Return u_safe_body
 
 The vrz (yaw rate) command is always passed through unchanged.  The CBF
 only filters translational (vx, vy) commands.
 
 Usage
 ─────
-    filt = CbfSafetyFilter(model_path='alpha_net_v5.pth')
+    filt = CbfSafetyFilter(model_path='kappa_net.pth')
     ...
     u_safe = filt.filter(
         u_perf_body = cmd_vel[:2],   # (vx, vy) body frame from MotionMapper
@@ -30,36 +30,33 @@ Usage
 
 from __future__ import annotations
 
-import os
 from typing import List
 
 import numpy as np
 import torch
 
-from mocap_teleop.ctrl.alpha_net import AlphaNet, _V_SCALE, _D_SCALE, _V_ACT_SCALE
-from mocap_teleop.ctrl.cbf_qp import (CBFQP, Obstacle, world_to_body,
-                                       ROBOT_HALF_LENGTH)
+from mocap_teleop.ctrl.kappa_net import KappaNet
+from mocap_teleop.ctrl.cbf_qp import CBFQP, Obstacle, cbf_value
 
 
 class CbfSafetyFilter:
     """
-    Learned CBF safety filter.
+    AM-CBF safety filter using a trained κ-net.
 
     Parameters
     ----------
-    model_path     : path to saved α-net weights (.pth file)
-    v_max          : maximum translational speed, same as during training (m/s)
-    max_obstacles  : maximum number of obstacles to consider per step.
-                     If more are detected, the closest ones are used.
-    device         : torch device ('cpu' or 'cuda')
-    enabled        : if False, filter is a passthrough (useful for A/B testing)
+    model_path    : path to saved κ-net weights (.pth file)
+    v_max         : maximum translational speed (m/s)
+    max_obstacles : max obstacles to consider per step (closest are used)
+    device        : torch device ('cpu' or 'cuda')
+    enabled       : if False, filter is a passthrough (useful for A/B testing)
     """
 
     def __init__(
         self,
         model_path:    str,
         v_max:         float = 1.5,
-        max_obstacles: int   = 5,
+        max_obstacles: int   = 3,
         device:        str   = 'cpu',
         enabled:       bool  = True,
     ):
@@ -67,69 +64,54 @@ class CbfSafetyFilter:
         self.max_obstacles = max_obstacles
         self._device       = torch.device(device)
 
-        self._alpha_net = AlphaNet(hidden_dim=64).to(self._device)
-        self._alpha_net.load(model_path, device=device)
-        # load() already calls eval() — confirm
-        self._alpha_net.eval()
+        self._kappa_net = KappaNet(hidden_dim=7).to(self._device)
+        self._kappa_net.load(model_path, device=device)
 
         self._cbf_qp = CBFQP(v_max=v_max, max_obstacles=max_obstacles)
 
         # Diagnostic counters (reset each second by the node)
-        self.n_filtered  = 0   # steps where u_safe ≠ u_perf (filter was active)
-        self.n_total     = 0   # total steps processed
+        self.n_filtered = 0
+        self.n_total    = 0
 
     def filter(
         self,
-        u_perf_body:   np.ndarray,
-        robot_pos:     np.ndarray,
-        robot_yaw:     float,
-        obstacles:     List[Obstacle],
-        v_actual_body: np.ndarray = None,
+        u_perf_body: np.ndarray,
+        robot_pos:   np.ndarray,
+        robot_yaw:   float,
+        obstacles:   List[Obstacle],
     ) -> np.ndarray:
         """
-        Apply the ECBF safety filter to a nominal body-frame velocity command.
+        Apply the AM-CBF safety filter to a nominal body-frame velocity command.
 
         Parameters
         ----------
-        u_perf_body   : (2,) [vx, vy] nominal velocity in robot body frame
-        robot_pos     : (2,) robot position in world/odom frame
-        robot_yaw     : robot heading (radians), world frame
-        obstacles     : list of Obstacle (center, radius) in world/odom frame
-        v_actual_body : (2,) actual robot velocity in body frame (from odometry
-                        or mocap diff).  Defaults to zeros if not provided.
+        u_perf_body : (2,) [vx, vy] nominal velocity in robot body frame
+        robot_pos   : (2,) robot position in world/odom frame
+        robot_yaw   : robot heading (radians), world frame
+        obstacles   : list of Obstacle (center, radius) in world/odom frame
 
         Returns
         -------
-        u_safe_body : (2,) safe velocity in robot body frame
-                      Equals u_perf_body when no obstacle is nearby or
+        u_safe_body : (2,) safe velocity in robot body frame.
+                      Equals u_perf_body when no obstacles are nearby or
                       the filter is disabled.
         """
         self.n_total += 1
 
-        if v_actual_body is None:
-            v_actual_body = np.zeros(2)
-
         if not self.enabled or len(obstacles) == 0:
             return u_perf_body.copy()
 
-        # Use the closest obstacles (up to max_obstacles) — far obstacles
-        # have h >> 0 so their CBF constraints are inactive anyway, but
-        # excluding them keeps the QP small and fast.
-        obs = self._select_closest(obstacles, robot_pos)
+        obs        = self._select_closest(obstacles, robot_pos)
+        kappa_vals = self._compute_kappa(robot_pos, robot_yaw, obs)
 
-        k_vals = self._compute_k_vals(u_perf_body, robot_pos, robot_yaw,
-                                       v_actual_body, obs)
-
-        u_safe_body = self._cbf_qp.solve_fast(
-            u_perf_body   = u_perf_body,
-            obstacles     = obs,
-            p_robot       = robot_pos,
-            yaw           = robot_yaw,
-            k_vals        = k_vals,
-            v_actual_body = v_actual_body,
+        u_safe_body = self._cbf_qp.solve_fast_cbf(
+            u_perf_body = u_perf_body,
+            obstacles   = obs,
+            p_robot     = robot_pos,
+            yaw         = robot_yaw,
+            kappa_vals  = kappa_vals,
         )
 
-        # Count as "filtered" if the command changed meaningfully
         if np.linalg.norm(u_safe_body - u_perf_body) > 1e-3:
             self.n_filtered += 1
 
@@ -153,7 +135,7 @@ class CbfSafetyFilter:
         obstacles: List[Obstacle],
         robot_pos: np.ndarray,
     ) -> List[Obstacle]:
-        """Return up to max_obstacles obstacles sorted by distance."""
+        """Return up to max_obstacles closest obstacles."""
         if len(obstacles) <= self.max_obstacles:
             return obstacles
         dists = [np.linalg.norm(obs.center - robot_pos) for obs in obstacles]
@@ -161,47 +143,18 @@ class CbfSafetyFilter:
         return [obstacles[i] for i in idx]
 
     @torch.no_grad()
-    def _compute_k_vals(
+    def _compute_kappa(
         self,
-        u_perf_body:   np.ndarray,
-        robot_pos:     np.ndarray,
-        robot_yaw:     float,
-        v_actual_body: np.ndarray,
-        obstacles:     List[Obstacle],
-    ) -> List[tuple]:
-        """Run α-net for each obstacle and return a list of (k1, k2) tuples."""
-        c, s = np.cos(robot_yaw), np.sin(robot_yaw)
-        R    = np.array([[c, -s], [s, c]])   # body → world;  R^T = world → body
+        robot_pos: np.ndarray,
+        robot_yaw: float,
+        obstacles: List[Obstacle],
+    ) -> List[float]:
+        """Evaluate κ(h_i) for each obstacle."""
+        h_vals = np.array([
+            cbf_value(robot_pos, obs.center, robot_yaw, obs.radius)
+            for obs in obstacles
+        ], dtype=np.float32)
 
-        k_vals = []
-        for obs in obstacles:
-            d_world       = obs.center - robot_pos
-            d_to_obs_body = R.T @ d_world
-            h_val         = float(
-                np.dot(d_world, d_world) / (ROBOT_HALF_LENGTH + obs.radius) ** 2
-                - 1.0
-            )
-
-            # d_to_goal proxy: u_perf × (D_SCALE / V_SCALE) ≈ 2 s of travel.
-            # Gives a vector in the commanded direction with ~3 m magnitude,
-            # matching the training distribution.
-            d_to_goal_proxy = u_perf_body * (_D_SCALE / _V_SCALE)
-
-            feat = AlphaNet.build_input(
-                d_to_obs_body = torch.tensor(
-                    d_to_obs_body,    dtype=torch.float32, device=self._device),
-                r             = torch.tensor(
-                    [obs.radius],     dtype=torch.float32, device=self._device),
-                h             = torch.tensor(
-                    [h_val],          dtype=torch.float32, device=self._device),
-                u_perf        = torch.tensor(
-                    u_perf_body,      dtype=torch.float32, device=self._device),
-                d_to_goal     = torch.tensor(
-                    d_to_goal_proxy,  dtype=torch.float32, device=self._device),
-                v_actual_body = torch.tensor(
-                    v_actual_body,    dtype=torch.float32, device=self._device),
-            )
-            k = self._alpha_net(feat).cpu().numpy().flatten()
-            k_vals.append((float(k[0]), float(k[1])))
-
-        return k_vals
+        h_tensor   = torch.tensor(h_vals, device=self._device)
+        kappa_vals = self._kappa_net(h_tensor).cpu().numpy()
+        return [float(k) for k in kappa_vals]

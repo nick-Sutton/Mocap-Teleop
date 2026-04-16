@@ -244,6 +244,80 @@ class CBFQP:
 
         return world_to_body(u_world, yaw)
 
+    # ── κ-CBF fast backend (OSQP) ────────────────────────────────────────────
+
+    def solve_fast_cbf(
+        self,
+        u_perf_body: np.ndarray,
+        obstacles:   List[Obstacle],
+        p_robot:     np.ndarray,
+        yaw:         float,
+        kappa_vals:  List[float],
+    ) -> np.ndarray:
+        """
+        Solve the 1st-order CBF-QP with OSQP.  Use this at deployment with
+        the trained κ-net (AM-CBF).
+
+        Constraint per obstacle i:
+            (∂h_i/∂p) · u  ≥  −κ(h_i)
+
+        Simpler than solve_fast() — no velocity state or ECBF gains needed.
+
+        Parameters
+        ----------
+        u_perf_body : (2,) nominal velocity command in body frame [vx, vy]
+        obstacles   : list of Obstacle (world frame)
+        p_robot     : (2,) robot position in world frame
+        yaw         : robot heading (rad)
+        kappa_vals  : list of κ(h_i) per obstacle — from KappaNet
+
+        Returns
+        -------
+        u_safe_body : (2,) safe velocity in body frame; falls back to
+                      u_perf_body if OSQP fails.
+        """
+        u_perf_world = body_to_world(u_perf_body, yaw)
+
+        P = sp.eye(2, format='csc') * 2.0
+        q = -2.0 * u_perf_world
+
+        n = len(obstacles)
+        if n > 0:
+            grads = np.vstack([
+                cbf_gradient(p_robot, obs.center, yaw, obs.radius,
+                             self.robot_half_length, self.robot_half_width)
+                for obs in obstacles
+            ])                                         # (n, 2)
+            rhs = np.array([-k for k in kappa_vals])  # (n,)  = −κ(h_i)
+
+            A_full = sp.csc_matrix(np.vstack([grads, np.eye(2)]))
+            l_full = np.concatenate([rhs,
+                                     [-self.v_max, -self.v_max]])
+            u_full = np.concatenate([np.full(n, np.inf),
+                                     [self.v_max,  self.v_max]])
+        else:
+            A_full = sp.eye(2, format='csc')
+            l_full = np.array([-self.v_max, -self.v_max])
+            u_full = np.array([ self.v_max,  self.v_max])
+
+        solver = osqp.OSQP()
+        solver.setup(
+            P, q, A_full, l_full, u_full,
+            warm_starting = True,
+            verbose       = False,
+            eps_abs       = 1e-4,
+            eps_rel       = 1e-4,
+            max_iter      = 1000,
+        )
+        result = solver.solve()
+
+        if result.info.status in ('solved', 'solved_inaccurate'):
+            u_world = result.x
+        else:
+            u_world = u_perf_world
+
+        return world_to_body(u_world, yaw)
+
     # ── Differentiable backend (Dykstra projection) ──────────────────────────
 
     def solve_differentiable_batch(
