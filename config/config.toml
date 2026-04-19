@@ -23,6 +23,7 @@ interface_subpath = "~/ros_ws/src/mocap_teleop/mpac_mujoco/mpac_go2/atnmy/"
 
 [learning]
 gait_classifier_path = "ModelV1.pth"
+cbf_model_path       = "kappa_net_3.pth"   # set to "" to disable CBF filter
 
 [logging]
 logs_dir = "robot_logs"

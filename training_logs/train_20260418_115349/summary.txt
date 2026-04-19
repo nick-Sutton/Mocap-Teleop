@@ -1,0 +1,8 @@
+episodes       : 1000
+mean reward    : -9.132
+final reward   : -4.037  (last 20 ep)
+mean min_h     : +0.0729
+mean steps     : 46.4
+update steps   : 22695
+final critic L : 0.270850
+final kappa L  : 1.591733

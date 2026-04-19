@@ -1,0 +1,5 @@
+episodes       : 20
+goal reach     : 20/20 (100.0%)
+mean reward    : -23.133
+mean min_h     : +0.1242
+h<0 step rate  : 0.90%

@@ -251,17 +251,14 @@ class TeleopNode(Node):
             if sleep_time > 0:
                 time.sleep(sleep_time)
 
-    # ── PD control loop (Python thread, 1000 Hz) ──────────────────────────────
+    # ── PD control loop ──────────────────────────────
 
     def _pd_loop(self) -> None:
         """Runs in a dedicated thread — not managed by the ROS2 executor."""
-        dt = 1.0 / _PD_RATE_HZ
         _telemetry_warned = False
         _stopped = False   # track whether soft_stop has already been sent
 
         while self._running:
-            t0 = time.monotonic()
-
             if self._latest_human_state is not None:
                 if time.monotonic() - self._last_mocap_time <= _MOCAP_TIMEOUT_S:
                     _stopped = False   # mocap is live again — re-arm stop
@@ -361,11 +358,6 @@ class TeleopNode(Node):
                     self.get_logger().info('Mocap stream ended — soft stop sent')
                     _stopped = True
                     rclpy.shutdown()
-
-            elapsed = time.monotonic() - t0
-            sleep_time = dt - elapsed
-            if sleep_time > 0:
-                time.sleep(sleep_time)
 
     # ── Frequency logging (1 Hz) ──────────────────────────────────────────────
 

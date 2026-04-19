@@ -131,10 +131,11 @@ class Go2TrainingEnv:
         self._pending_qpos:   np.ndarray | None = None
         self._reset_done:     threading.Event   = threading.Event()
 
-        # ── Viewer obstacle overlay ───────────────────────────────────────────
+        # ── Viewer obstacle / goal overlay ───────────────────────────────────
         # Set by the training/rollout loop each episode; the viewer loop draws
-        # semi-transparent cylinders at these positions.
-        self._vis_obstacles: list = []
+        # semi-transparent cylinders for obstacles and a green sphere for goal.
+        self._vis_obstacles: list           = []
+        self._vis_goal:      np.ndarray | None = None
 
         # Capture the home qpos from the "home" keyframe
         key_id = mujoco.mj_name2id(
@@ -300,17 +301,29 @@ class Go2TrainingEnv:
         """
         self._vis_obstacles = list(obstacles)
 
+    def set_vis_goal(self, goal: np.ndarray | None) -> None:
+        """
+        Set the goal position to render as a green sphere in the viewer.
+        Pass None to clear.  Thread-safe — Python assignment is atomic under GIL.
+        """
+        self._vis_goal = None if goal is None else np.asarray(goal, dtype=np.float64)
+
     def _viewer_loop(self) -> None:
-        """Viewer sync loop — 50 fps with obstacle overlay."""
-        _OBS_HEIGHT  = 1.0    # visual cylinder height (m)
-        _OBS_RGBA    = np.array([1.0, 0.35, 0.1, 0.45], dtype=np.float32)  # orange, semi-transparent
+        """Viewer sync loop — 50 fps with obstacle and goal overlay."""
+        _OBS_HEIGHT   = 1.0    # visual cylinder height (m)
+        _OBS_RGBA     = np.array([1.0, 0.35, 0.1, 0.45], dtype=np.float32)  # orange, semi-transparent
+        _GOAL_RADIUS  = 0.15   # visual sphere radius (m)
+        _GOAL_RGBA    = np.array([0.1, 0.9, 0.1, 0.9], dtype=np.float32)    # green
         _MAT_IDENTITY = np.eye(3, dtype=np.float64).flatten()
 
         while self._running and self._viewer.is_running():
-            obs_list = self._vis_obstacles   # snapshot (GIL-safe)
+            obs_list = self._vis_obstacles   # snapshots (GIL-safe)
+            goal     = self._vis_goal
 
             with self._viewer.lock():
                 self._viewer.user_scn.ngeom = 0
+
+                # ── Obstacle cylinders ────────────────────────────────────────
                 for obs in obs_list:
                     n = self._viewer.user_scn.ngeom
                     if n >= self._viewer.user_scn.maxgeom:
@@ -324,6 +337,20 @@ class Go2TrainingEnv:
                         rgba  = _OBS_RGBA,
                     )
                     self._viewer.user_scn.ngeom += 1
+
+                # ── Goal sphere ───────────────────────────────────────────────
+                if goal is not None:
+                    n = self._viewer.user_scn.ngeom
+                    if n < self._viewer.user_scn.maxgeom:
+                        mujoco.mjv_initGeom(
+                            self._viewer.user_scn.geoms[n],
+                            type  = mujoco.mjtGeom.mjGEOM_SPHERE,
+                            size  = np.array([_GOAL_RADIUS, 0.0, 0.0]),
+                            pos   = np.array([goal[0], goal[1], _GOAL_RADIUS]),
+                            mat   = _MAT_IDENTITY,
+                            rgba  = _GOAL_RGBA,
+                        )
+                        self._viewer.user_scn.ngeom += 1
 
             with self._lock:
                 self._viewer.sync()

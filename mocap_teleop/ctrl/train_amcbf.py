@@ -41,11 +41,15 @@ from __future__ import annotations
 
 import argparse
 import collections
+import datetime
 import os
 import random
 import time
 from typing import Dict, List, NamedTuple, Tuple
 
+import matplotlib
+matplotlib.use('Agg')   # headless backend — no display needed
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
@@ -66,7 +70,10 @@ _V_MAX          = 1.5      # m/s — nominal walk speed cap
 _KP_NOMINAL     = 1.5      # P-gain for goal-reaching nominal policy
 _KP_YAW         = 2.0      # P-gain for heading controller (rad/s per rad)
 _VRZ_MAX        = 1.2      # max yaw rate (rad/s)
-_SAFETY_WEIGHT  = 1.0      # reward penalty weight for h < 0 violations
+_SAFETY_WEIGHT  = 10.0     # reward penalty weight for h < 0 violations
+                           #   distance reward is in [-1,0]/step; weight=10 makes
+                           #   safety the dominant term so κ learns conservatism
+_GOAL_BONUS     = 5.0      # one-time reward for reaching the goal
 _STEP_PENALTY   = 0.005    # constant per-step cost (encourages minimum-time)
 _MAX_OBS        = 3        # max obstacles per episode
 _ARENA_HALF     = 3.0      # half-width of square sampling arena (m)
@@ -80,17 +87,18 @@ _T              = 200      # max steps per episode
 _CTRL_DT        = 0.05     # seconds between control steps (20 Hz)
 
 _BUFFER_SIZE    = 50_000   # replay buffer capacity
-_BATCH_SIZE     = 64
+_BATCH_SIZE     = 128
 _GAMMA          = 0.99     # discount factor
 _TAU_TARGET     = 0.7      # soft target update coefficient (paper Table I)
 _LR_CRITIC      = 1e-3     # critic learning rate
-_LR_KAPPA       = 1e-3     # κ-net learning rate
+_LR_KAPPA       = 5e-4     # κ-net learning rate (lower than critic — loss was 3.8)
 
 _OU_THETA       = 0.15     # Ornstein-Uhlenbeck noise θ
-_OU_SIGMA       = 0.2      # Ornstein-Uhlenbeck noise σ
+_OU_SIGMA_START = 0.2      # exploration noise at episode 0
+_OU_SIGMA_END   = 0.02     # exploration noise at final episode (≈ no noise)
 
 _WARMUP_STEPS   = 1000     # collect this many steps before first update
-_UPDATE_EVERY   = 1        # update networks every N steps
+_UPDATE_EVERY   = 2        # update networks every N steps (less correlated)
 
 # State dimension: [d_goal(2), vel_body(2), per_obs: d_obs(2)+r(1)+h(1)] × MAX_OBS
 _STATE_DIM      = 4 + _MAX_OBS * 4
@@ -99,6 +107,10 @@ _STATE_DIM      = 4 + _MAX_OBS * 4
 _D_SCALE        = _ARENA_HALF * 2   # metres
 _H_SCALE        = 5.0               # CBF value upper clamp for normalisation
 _R_SCALE        = 1.0               # obstacle radius scale
+
+# Training / rollout log output directory (sibling of the ctrl/ package)
+_SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
+_LOGS_ROOT   = os.path.abspath(os.path.join(_SCRIPT_DIR, '..', '..', 'training_logs'))
 
 
 # ── Critic network ────────────────────────────────────────────────────────────
@@ -160,7 +172,7 @@ class ReplayBuffer:
 
 class OUNoise:
     def __init__(self, size: int, theta: float = _OU_THETA,
-                 sigma: float = _OU_SIGMA):
+                 sigma: float = _OU_SIGMA_START):
         self.size  = size
         self.theta = theta
         self.sigma = sigma
@@ -168,6 +180,10 @@ class OUNoise:
 
     def reset(self) -> None:
         self.state = np.zeros(self.size)
+
+    def set_sigma(self, sigma: float) -> None:
+        """Decay exploration noise over training."""
+        self.sigma = sigma
 
     def sample(self) -> np.ndarray:
         self.state += (
@@ -372,22 +388,26 @@ def _soft_update(target: nn.Module, source: nn.Module, tau: float) -> None:
 # ── Main training loop ────────────────────────────────────────────────────────
 
 def train(
-    n_episodes:  int  = 300,
-    n_steps:     int  = _T,
-    out_path:    str  = 'kappa_net.pth',
-    use_viewer:  bool = False,
-    device_str:  str  = 'cpu',
+    n_episodes:       int  = 300,
+    n_steps:          int  = _T,
+    out_path:         str  = 'kappa_net.pth',
+    use_viewer:       bool = False,
+    device_str:       str  = 'cpu',
+    checkpoint_every: int  = 100,
+    resume_from:      str  = '',
 ) -> KappaNet:
     """
     Run DDPG training and return the trained κ-net.
 
     Parameters
     ----------
-    n_episodes  : number of training episodes
-    n_steps     : max steps per episode
-    out_path    : where to save the final κ-net weights
-    use_viewer  : launch MuJoCo viewer for debugging
-    device_str  : torch device ('cpu' or 'cuda')
+    n_episodes       : number of training episodes
+    n_steps          : max steps per episode
+    out_path         : where to save the final κ-net weights
+    use_viewer       : launch MuJoCo viewer for debugging
+    device_str       : torch device ('cpu' or 'cuda')
+    checkpoint_every : save weights every N episodes (0 = disabled)
+    resume_from      : path to a checkpoint .pth to resume from
     """
     device = torch.device(device_str)
 
@@ -399,6 +419,20 @@ def train(
 
     opt_kappa    = optim.Adam(kappa_net.parameters(), lr=_LR_KAPPA)
     opt_critic   = optim.Adam(critic.parameters(),    lr=_LR_CRITIC)
+
+    # ── Resume from checkpoint ────────────────────────────────────────────────
+    start_ep = 0
+    if resume_from and os.path.isfile(resume_from):
+        ckpt = torch.load(resume_from, map_location=device)
+        kappa_net.load_state_dict(ckpt['kappa_net'])
+        critic.load_state_dict(ckpt['critic'])
+        critic_tgt.load_state_dict(ckpt['critic_tgt'])
+        opt_kappa.load_state_dict(ckpt['opt_kappa'])
+        opt_critic.load_state_dict(ckpt['opt_critic'])
+        start_ep = ckpt.get('episode', 0)
+        print(f'[resume] loaded checkpoint from {resume_from}  (ep {start_ep})')
+    elif resume_from:
+        print(f'[resume] checkpoint not found: {resume_from} — starting fresh')
 
     # ── Environment ───────────────────────────────────────────────────────────
     ctrl = CtrlInterface()
@@ -414,11 +448,24 @@ def train(
 
     total_steps = 0
 
-    for ep in range(n_episodes):
+    # ── Logging ───────────────────────────────────────────────────────────────
+    run_dir            = _make_run_dir('train')
+    ep_rewards_log:    List[float] = []
+    ep_min_hs_log:     List[float] = []
+    ep_steps_log:      List[int]   = []
+    critic_losses_log: List[float] = []
+    kappa_losses_log:  List[float] = []
+
+    for ep in range(start_ep, n_episodes):
+        # Decay exploration noise linearly: σ_start → σ_end over all episodes
+        sigma = _OU_SIGMA_START + (_OU_SIGMA_END - _OU_SIGMA_START) * ep / max(n_episodes - 1, 1)
+        ou_noise.set_sigma(sigma)
+
         # Sample new episode geometry
         start, goal, obstacles = _sample_episode()
         obs_centers, obs_radii = _pack_obs(obstacles)
         env.set_vis_obstacles(obstacles)
+        env.set_vis_goal(goal)
 
         # Teleport robot to start
         env.reset(start, heading=0.0, ctrl=ctrl)
@@ -428,8 +475,9 @@ def train(
 
         ou_noise.reset()
         state_dict = env.get_state()
-        ep_reward  = 0.0
-        ep_min_h   = float('inf')
+        ep_reward    = 0.0
+        ep_min_h     = float('inf')
+        goal_reached = False
 
         for step in range(n_steps):
             pos_xy   = state_dict['pos_xy']
@@ -485,14 +533,18 @@ def train(
             vel_body_next = next_dict['vel_body']
 
             dist_to_goal  = np.linalg.norm(pos_xy_next - goal)
-            done          = dist_to_goal < _GOAL_RADIUS or step == n_steps - 1
+            goal_reached  = dist_to_goal < _GOAL_RADIUS
+            done          = goal_reached or step == n_steps - 1
 
-            # Reward: negative normalised distance + safety penalty for h < 0.
-            # Distance term bounded in [-1, 0]; safety penalty adds up to
-            # -_SAFETY_WEIGHT per obstacle per step when fully penetrated.
+            # Reward: negative normalised distance + safety penalty + goal bonus.
+            # Distance term bounded in [-1, 0]/step; _SAFETY_WEIGHT=10 makes
+            # safety dominant so κ strongly penalises h < 0.
+            # _GOAL_BONUS provides a positive anchor for the Q-function.
             reward = -float(dist_to_goal) / _ARENA_DIAG - _STEP_PENALTY
             if len(h_vals) > 0:
                 reward += _SAFETY_WEIGHT * float(np.sum(np.minimum(h_vals, 0.0)))
+            if goal_reached:
+                reward += _GOAL_BONUS
             ep_reward += reward
 
             # ── Next state obs for target QP ──────────────────────────────────
@@ -525,8 +577,10 @@ def train(
             # ── Network updates ───────────────────────────────────────────────
             if (len(buffer) >= _WARMUP_STEPS and
                     total_steps % _UPDATE_EVERY == 0):
-                _update(buffer, kappa_net, critic, critic_tgt,
-                        opt_kappa, opt_critic, cbf_qp, device)
+                lq, lk = _update(buffer, kappa_net, critic, critic_tgt,
+                                 opt_kappa, opt_critic, cbf_qp, device)
+                critic_losses_log.append(lq)
+                kappa_losses_log.append(lk)
 
             if done:
                 break
@@ -536,15 +590,37 @@ def train(
         if len(buffer) >= _WARMUP_STEPS:
             _soft_update(critic_tgt, critic, _TAU_TARGET)
 
-        print(f'[ep {ep+1:4d}/{n_episodes}]  '
+        ep_steps_taken = step + 1
+        ep_rewards_log.append(ep_reward)
+        ep_min_hs_log.append(ep_min_h if ep_min_h != float('inf') else 0.0)
+        ep_steps_log.append(ep_steps_taken)
+
+        goal_tag = 'GOAL' if goal_reached else '    '
+        print(f'[ep {ep+1:4d}/{n_episodes}] {goal_tag}  '
               f'reward={ep_reward:7.1f}  '
               f'min_h={ep_min_h:+.3f}  '
-              f'buf={len(buffer)}')
+              f'steps={ep_steps_taken:3d}  '
+              f'σ={sigma:.3f}  buf={len(buffer)}')
+
+        # ── Periodic checkpoint ───────────────────────────────────────────────
+        if checkpoint_every > 0 and (ep + 1) % checkpoint_every == 0:
+            ckpt_path = out_path.replace('.pth', f'_ep{ep+1}.pth')
+            torch.save({
+                'episode':    ep + 1,
+                'kappa_net':  kappa_net.state_dict(),
+                'critic':     critic.state_dict(),
+                'critic_tgt': critic_tgt.state_dict(),
+                'opt_kappa':  opt_kappa.state_dict(),
+                'opt_critic': opt_critic.state_dict(),
+            }, ckpt_path)
+            print(f'[checkpoint] saved → {ckpt_path}')
 
     # ── Save ──────────────────────────────────────────────────────────────────
     ctrl.soft_stop()
     env.close()
     kappa_net.save(out_path)
+    _save_training_plots(run_dir, ep_rewards_log, ep_min_hs_log,
+                         ep_steps_log, critic_losses_log, kappa_losses_log)
     return kappa_net
 
 
@@ -559,8 +635,8 @@ def _update(
     opt_critic: optim.Optimizer,
     cbf_qp:     CBFQP,
     device:     torch.device,
-) -> None:
-    """One gradient step for critic and κ-net from a sampled mini-batch."""
+) -> Tuple[float, float]:
+    """One gradient step for critic and κ-net.  Returns (critic_loss, kappa_loss)."""
     batch = buffer.sample(_BATCH_SIZE)
 
     # ── Unpack batch ──────────────────────────────────────────────────────────
@@ -654,6 +730,8 @@ def _update(
 
     # Target network update is done once per episode (see train loop),
     # not here — τ=0.7 per-step would collapse target→online in ~10 steps.
+
+    return float(loss_q.item()), float(loss_kappa.item())
 
 
 # ── Batch helpers ─────────────────────────────────────────────────────────────
@@ -765,6 +843,7 @@ def rollout(
     for ep in range(n_episodes):
         start, goal, obstacles = _sample_episode()
         env.set_vis_obstacles(obstacles)
+        env.set_vis_goal(goal)
         env.reset(start, heading=0.0, ctrl=ctrl)
         ctrl.walk(vx=0, vy=0, vrz=0)
         time.sleep(0.3)
@@ -846,6 +925,193 @@ def rollout(
           f'({viol_pct:.1f}%)')
     print('─────────────────────────────────────────────────')
 
+    run_dir = _make_run_dir('rollout')
+    _save_rollout_plots(run_dir, ep_rewards, min_hs, reached, viol_pct, n_episodes)
+
+
+# ── Logging helpers ───────────────────────────────────────────────────────────
+
+def _make_run_dir(tag: str) -> str:
+    """Create and return a timestamped run directory under _LOGS_ROOT."""
+    ts      = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    run_dir = os.path.join(_LOGS_ROOT, f'{tag}_{ts}')
+    os.makedirs(run_dir, exist_ok=True)
+    return run_dir
+
+
+def _smooth(values: List[float], window: int = 20) -> np.ndarray:
+    """Uniform moving-average smoothing; handles series shorter than window."""
+    if len(values) == 0:
+        return np.array([])
+    w   = min(window, len(values))
+    ker = np.ones(w) / w
+    return np.convolve(values, ker, mode='valid')
+
+
+def _save_training_plots(
+    run_dir:       str,
+    ep_rewards:    List[float],
+    ep_min_hs:     List[float],
+    ep_steps:      List[int],
+    critic_losses: List[float],
+    kappa_losses:  List[float],
+) -> None:
+    """Save four training diagnostic plots to *run_dir*."""
+    eps = np.arange(1, len(ep_rewards) + 1)
+
+    # ── 1. Reward curve ───────────────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.plot(eps, ep_rewards, alpha=0.35, color='steelblue', label='per episode')
+    if len(ep_rewards) >= 5:
+        sm = _smooth(ep_rewards)
+        ax.plot(np.arange(len(sm)) + (len(ep_rewards) - len(sm)) // 2 + 1,
+                sm, color='steelblue', linewidth=2, label='smoothed (w=20)')
+    ax.set_xlabel('Episode')
+    ax.set_ylabel('Cumulative reward')
+    ax.set_title('Training reward')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(os.path.join(run_dir, 'reward_curve.png'), dpi=150)
+    plt.close(fig)
+
+    # ── 2. Safety (min CBF value) ─────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.axhline(0.0, color='red', linewidth=1.2, linestyle='--', label='h = 0 (safety boundary)')
+    ax.plot(eps, ep_min_hs, alpha=0.35, color='darkorange', label='min h per episode')
+    if len(ep_min_hs) >= 5:
+        sm = _smooth(ep_min_hs)
+        ax.plot(np.arange(len(sm)) + (len(ep_min_hs) - len(sm)) // 2 + 1,
+                sm, color='darkorange', linewidth=2, label='smoothed (w=20)')
+    ax.set_xlabel('Episode')
+    ax.set_ylabel('min h(x)')
+    ax.set_title('CBF safety margin (min h per episode)')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(os.path.join(run_dir, 'safety_curve.png'), dpi=150)
+    plt.close(fig)
+
+    # ── 3. Steps to termination ───────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.plot(eps, ep_steps, alpha=0.35, color='mediumseagreen', label='steps per episode')
+    if len(ep_steps) >= 5:
+        sm = _smooth(ep_steps)
+        ax.plot(np.arange(len(sm)) + (len(ep_steps) - len(sm)) // 2 + 1,
+                sm, color='mediumseagreen', linewidth=2, label='smoothed (w=20)')
+    ax.set_xlabel('Episode')
+    ax.set_ylabel('Steps')
+    ax.set_title('Steps to termination (lower = faster goal reach)')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(os.path.join(run_dir, 'steps_per_episode.png'), dpi=150)
+    plt.close(fig)
+
+    # ── 4. Network losses ─────────────────────────────────────────────────────
+    if critic_losses:
+        upd = np.arange(1, len(critic_losses) + 1)
+        fig, axes = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
+        for vals, color, label, ax in [
+            (critic_losses, 'royalblue',  'Critic loss (MSE)', axes[0]),
+            (kappa_losses,  'tomato',     'κ-net loss (−Q)',   axes[1]),
+        ]:
+            ax.plot(upd, vals, alpha=0.3, color=color)
+            if len(vals) >= 20:
+                sm = _smooth(vals, window=50)
+                ax.plot(np.arange(len(sm)) + (len(vals) - len(sm)) // 2 + 1,
+                        sm, color=color, linewidth=2, label='smoothed (w=50)')
+            ax.set_ylabel(label)
+            ax.grid(True, alpha=0.3)
+            ax.legend()
+        axes[1].set_xlabel('Update step')
+        fig.suptitle('Network training losses')
+        fig.tight_layout()
+        fig.savefig(os.path.join(run_dir, 'loss_curves.png'), dpi=150)
+        plt.close(fig)
+
+    # ── Summary text ──────────────────────────────────────────────────────────
+    with open(os.path.join(run_dir, 'summary.txt'), 'w') as f:
+        f.write(f'episodes       : {len(ep_rewards)}\n')
+        f.write(f'mean reward    : {np.mean(ep_rewards):.3f}\n')
+        f.write(f'final reward   : {np.mean(ep_rewards[-20:]):.3f}  (last 20 ep)\n')
+        f.write(f'mean min_h     : {np.mean(ep_min_hs):+.4f}\n')
+        f.write(f'mean steps     : {np.mean(ep_steps):.1f}\n')
+        f.write(f'update steps   : {len(critic_losses)}\n')
+        if critic_losses:
+            f.write(f'final critic L : {np.mean(critic_losses[-100:]):.6f}\n')
+            f.write(f'final kappa L  : {np.mean(kappa_losses[-100:]):.6f}\n')
+
+    print(f'[plots] saved to {run_dir}')
+
+
+def _save_rollout_plots(
+    run_dir:    str,
+    ep_rewards: List[float],
+    min_hs:     List[float],
+    reached:    int,
+    viol_pct:   float,
+    n_episodes: int,
+) -> None:
+    """Save three rollout diagnostic plots to *run_dir*."""
+    eps = np.arange(1, n_episodes + 1)
+
+    # ── 1. Per-episode reward ─────────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.bar(eps, ep_rewards, color='steelblue', alpha=0.7)
+    ax.axhline(np.mean(ep_rewards), color='navy', linewidth=2,
+               linestyle='--', label=f'mean = {np.mean(ep_rewards):.2f}')
+    ax.set_xlabel('Episode')
+    ax.set_ylabel('Cumulative reward')
+    ax.set_title('Rollout reward per episode')
+    ax.legend()
+    ax.grid(True, alpha=0.3, axis='y')
+    fig.tight_layout()
+    fig.savefig(os.path.join(run_dir, 'rollout_reward.png'), dpi=150)
+    plt.close(fig)
+
+    # ── 2. Per-episode min CBF value ──────────────────────────────────────────
+    colors = ['tomato' if h < 0 else 'mediumseagreen' for h in min_hs]
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.bar(eps, min_hs, color=colors, alpha=0.8)
+    ax.axhline(0.0, color='red', linewidth=1.5, linestyle='--', label='h = 0')
+    ax.set_xlabel('Episode')
+    ax.set_ylabel('min h(x)')
+    ax.set_title('Minimum CBF value per rollout episode\n(red = constraint violated)')
+    ax.legend()
+    ax.grid(True, alpha=0.3, axis='y')
+    fig.tight_layout()
+    fig.savefig(os.path.join(run_dir, 'rollout_safety.png'), dpi=150)
+    plt.close(fig)
+
+    # ── 3. Summary bar chart ──────────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(5, 4))
+    labels = ['Goal reached (%)', 'h<0 steps (%)']
+    values = [100.0 * reached / max(n_episodes, 1), viol_pct]
+    bar_colors = ['mediumseagreen', 'tomato']
+    bars = ax.bar(labels, values, color=bar_colors, alpha=0.8, width=0.5)
+    for bar, val in zip(bars, values):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 1,
+                f'{val:.1f}%', ha='center', va='bottom', fontweight='bold')
+    ax.set_ylim(0, 115)
+    ax.set_ylabel('Percentage (%)')
+    ax.set_title(f'Rollout summary  ({n_episodes} episodes)')
+    ax.grid(True, alpha=0.3, axis='y')
+    fig.tight_layout()
+    fig.savefig(os.path.join(run_dir, 'rollout_summary.png'), dpi=150)
+    plt.close(fig)
+
+    # ── Summary text ──────────────────────────────────────────────────────────
+    with open(os.path.join(run_dir, 'summary.txt'), 'w') as f:
+        f.write(f'episodes       : {n_episodes}\n')
+        f.write(f'goal reach     : {reached}/{n_episodes} '
+                f'({100*reached/n_episodes:.1f}%)\n')
+        f.write(f'mean reward    : {np.mean(ep_rewards):.3f}\n')
+        f.write(f'mean min_h     : {np.mean(min_hs):+.4f}\n')
+        f.write(f'h<0 step rate  : {viol_pct:.2f}%\n')
+
+    print(f'[plots] saved to {run_dir}')
+
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -866,6 +1132,10 @@ def main() -> None:
                         help='launch MuJoCo viewer for debugging')
     parser.add_argument('--device',   type=str, default='cpu',
                         help='torch device (cpu or cuda)')
+    parser.add_argument('--checkpoint-every', type=int, default=100,
+                        help='save a checkpoint every N episodes (0 = disabled)')
+    parser.add_argument('--resume',   type=str, default='',
+                        help='resume training from a checkpoint .pth file')
     args = parser.parse_args()
 
     print('Make sure mpac is running before proceeding.')
@@ -884,9 +1154,11 @@ def main() -> None:
         print(f'  episodes={args.episodes}, steps/ep={args.steps}')
         print(f'  output={args.out}, viewer={args.viewer}')
         train(
-            n_episodes = args.episodes,
-            n_steps    = args.steps,
-            out_path   = args.out,
+            n_episodes       = args.episodes,
+            n_steps          = args.steps,
+            out_path         = args.out,
+            checkpoint_every = args.checkpoint_every,
+            resume_from      = args.resume,
             use_viewer = args.viewer,
             device_str = args.device,
         )
