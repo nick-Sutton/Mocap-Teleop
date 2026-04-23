@@ -18,10 +18,27 @@ Buffer-fill thread — Python thread: polls _new_mocap_frame at 1 kHz, runs
 Classifier thread  — Python thread: calls gc.infer() at ~13 Hz (capped by the
                      75ms TCN forward pass).  Sets _gait_prediction for PD.
 
-PD thread          — Python thread at 500 Hz using time.sleep().
-                     (Loop body ~2 ms; 1 kHz target was unachievable.)
+PD thread          — Python thread at 500 Hz using deadline-sleep.
+                     ROS2 Python timers cannot reliably enforce periods below
+                     ~10 ms so a dedicated thread is required for 500 Hz.
+
+FSM overview
+────────────
+IMITATE  — normal PD + CBF imitation control (default).
+PLAN     — feasibility estimator detected low Q; A* routes robot around
+            obstacle toward human's current position.
+RESYNC   — Q recovered above Q_HIGH; waypoint follower walks robot back
+            to within RESYNC_DIST_M of the human before re-entering IMITATE.
+
+Transitions
+  IMITATE → PLAN    : Q < Q_LOW for _FSM_CONFIRM_FRAMES consecutive ticks
+  PLAN    → RESYNC  : Q > Q_HIGH (safe path now available)
+  PLAN    → PLAN    : A* replans each tick as human moves
+  RESYNC  → IMITATE : distance to human < RESYNC_DIST_M
+  RESYNC  → PLAN    : Q < Q_LOW again (path still blocked)
 """
 
+import enum
 import os
 import threading
 import time
@@ -32,6 +49,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.executors import SingleThreadedExecutor, ExternalShutdownException
 from geometry_msgs.msg import Twist, TwistStamped, PoseStamped
+from nav_msgs.msg import OccupancyGrid as OccupancyGridMsg
 from std_msgs.msg import String, Bool
 from visualization_msgs.msg import MarkerArray
 
@@ -46,10 +64,22 @@ from mocap_teleop.util.freq_meter import FrequencyMeter
 from mocap_teleop.util.performance_metrics import PerformanceMetrics
 import mocap_teleop.util.io_parser as io
 
-_PD_RATE_HZ          = 500.0    # loop body ~2 ms → reliable at 500 Hz
-_CLASSIFIER_RATE_HZ  = 20.0     # cap at realistic CPU inference rate
+_PD_RATE_HZ          = 500.0    # deadline-sleep enforces this reliably
+_CLASSIFIER_RATE_HZ  = 20.0
 _LOG_RATE_HZ         = 1.0
 _MOCAP_TIMEOUT_S     = 0.5      # stop robot if no mocap for 500 ms
+
+# ── FSM thresholds ────────────────────────────────────────────────────────────
+_Q_LOW              = -30.0   # below this → PLAN (critic predicts failure)
+_Q_HIGH             = -20.0   # above this → RESYNC (path is viable again)
+_FSM_CONFIRM_FRAMES = 10      # consecutive low-Q ticks before entering PLAN
+_RESYNC_DIST_M      = 0.4     # re-enter IMITATE once this close to human
+
+
+class TeleopMode(enum.Enum):
+    IMITATE = 'IMITATE'
+    PLAN    = 'PLAN'
+    RESYNC  = 'RESYNC'
 
 
 class TeleopNode(Node):
@@ -98,6 +128,29 @@ class TeleopNode(Node):
                 self.get_logger().info(
                     'CBF model path not set — safety filter disabled')
 
+        # ── Feasibility estimator (optional) ──────────────────────────────────
+        critic_path = learning_cfg.get('critic_path', '')
+        if bool(critic_path) and os.path.isfile(critic_path):
+            from mocap_teleop.ctrl.feasibility_estimator import FeasibilityEstimator
+            from mocap_teleop.planning.mppi_planner import MPPIPlanner
+            self._feasibility = FeasibilityEstimator(critic_path)
+            self._mppi        = MPPIPlanner()
+            self.get_logger().info('Feasibility estimator ready — FSM enabled')
+        else:
+            self._feasibility = None
+            self._mppi        = None
+            if critic_path:
+                self.get_logger().warn(
+                    f'Critic path set but file not found: {critic_path}'
+                    ' — FSM disabled')
+            else:
+                self.get_logger().info('Critic path not set — FSM disabled')
+
+        # ── FSM state ─────────────────────────────────────────────────────────
+        self._fsm_mode:         TeleopMode = TeleopMode.IMITATE
+        self._fsm_low_q_count:  int        = 0   # consecutive low-Q ticks
+        self._costmap                      = None  # OccupancyGrid | None
+
         # ── Stand up before starting control threads ──────────────────────────
         self.get_logger().info('Sending stand command — waiting 3 s for robot to stand...')
         CtrlInterface.stand(0, 0, 0)
@@ -114,8 +167,7 @@ class TeleopNode(Node):
         self._last_cmd_vel:       np.ndarray | None = None
         self._running:            bool              = True
         # Obstacle list updated by /obstacles subscriber, consumed by PD thread.
-        # Written by the subscriber callback (ROS2 executor thread) and read by
-        # the PD thread — list replacement is GIL-atomic in CPython.
+        # List replacement is GIL-atomic in CPython — no lock needed.
         self._obstacles:          list              = []
 
         # ── Frequency meters ──────────────────────────────────────────────────
@@ -143,32 +195,30 @@ class TeleopNode(Node):
         self.create_subscription(
             Bool, '/mocap/tracking_valid',
             self._tracking_valid_cb, 10)
-        # Obstacles published as a MarkerArray of SPHERE markers.
-        # Each marker: position = obstacle center (odom frame),
-        #              scale.x  = obstacle diameter (radius = scale.x / 2).
-        # Publish to /obstacles from your perception node.
         if self._cbf_filter is not None:
             self.create_subscription(
                 MarkerArray, '/obstacles',
                 self._obstacles_cb, 10)
+        if self._mppi is not None:
+            self.create_subscription(
+                OccupancyGridMsg, '/local_costmap',
+                self._costmap_cb, 1)   # depth=1: only latest grid matters
 
         # ── Publishers ────────────────────────────────────────────────────────
         self._cmd_vel_pub = self.create_publisher(Twist,  '/cmd_vel',     10)
         self._gait_pub    = self.create_publisher(String, '/teleop/gait', 10)
+        self._mode_pub    = self.create_publisher(String, '/teleop/mode', 10)
 
         # ── Timers ────────────────────────────────────────────────────────────
         self.create_timer(1.0 / _LOG_RATE_HZ, self._log_freq_cb)
 
-        # ── Background threads — all heavy work runs here, not in executor ─────
-        # Buffer-fill: extract features + update TCN window at mocap rate.
+        # ── Background threads ────────────────────────────────────────────────
         self._buf_thread = threading.Thread(
             target=self._buffer_fill_loop, name='buf_fill', daemon=True)
         self._buf_thread.start()
-        # Classifier: TCN inference at ~13 Hz (limited by 75ms forward pass).
         self._cls_thread = threading.Thread(
             target=self._classifier_loop, name='classifier', daemon=True)
         self._cls_thread.start()
-        # PD: 1000 Hz control loop.
         self._pd_thread = threading.Thread(
             target=self._pd_loop, name='pd_control', daemon=True)
         self._pd_thread.start()
@@ -195,7 +245,6 @@ class TeleopNode(Node):
           pose.position.{x,y} — obstacle center in odom frame
           scale.x             — sphere diameter (radius = scale.x / 2)
 
-        This is the standard format from most ROS2 obstacle detection packages.
         List replacement is GIL-atomic so no lock is needed.
         """
         obs = []
@@ -206,6 +255,21 @@ class TeleopNode(Node):
             if radius > 0.01:   # ignore degenerate markers
                 obs.append(Obstacle(center=center, radius=radius))
         self._obstacles = obs
+
+    def _costmap_cb(self, msg: OccupancyGridMsg) -> None:
+        """Convert incoming OccupancyGrid to a queryable OccupancyGrid wrapper.
+
+        Runs in the ROS executor thread; assignment is GIL-atomic.
+        """
+        from mocap_teleop.planning.mppi_planner import OccupancyGrid
+        self._costmap = OccupancyGrid(
+            data       = np.array(msg.data, dtype=np.int8),
+            width      = msg.info.width,
+            height     = msg.info.height,
+            resolution = msg.info.resolution,
+            origin_x   = msg.info.origin.position.x,
+            origin_y   = msg.info.origin.position.y,
+        )
 
     # ── Buffer-fill thread ────────────────────────────────────────────────────
 
@@ -230,11 +294,7 @@ class TeleopNode(Node):
     # ── Classifier thread (~13 Hz, limited by TCN inference time) ────────────
 
     def _classifier_loop(self) -> None:
-        """Runs TCN inference as fast as the model allows (target 20 Hz).
-
-        Runs in a Python thread — NOT via ROS2 executor — so inference never
-        blocks subscriber callbacks.  Publishers are thread-safe in ROS2.
-        """
+        """Runs TCN inference as fast as the model allows (target 20 Hz)."""
         dt = 1.0 / _CLASSIFIER_RATE_HZ
         while self._running:
             t0 = time.monotonic()
@@ -251,20 +311,26 @@ class TeleopNode(Node):
             if sleep_time > 0:
                 time.sleep(sleep_time)
 
-    # ── PD control loop ──────────────────────────────
+    # ── PD control thread (500 Hz) ────────────────────────────────────────────
 
     def _pd_loop(self) -> None:
-        """Runs in a dedicated thread — not managed by the ROS2 executor."""
+        """Dedicated thread at 500 Hz using a deadline-sleep pattern.
+
+        A deadline sleep (sleep for the remaining time each iteration) reliably
+        enforces the target rate.  ROS2 Python timers cannot enforce periods
+        below ~10 ms due to GIL scheduling overhead.
+        """
+        _target_dt        = 1.0 / _PD_RATE_HZ   # 0.002 s
         _telemetry_warned = False
-        _stopped = False   # track whether soft_stop has already been sent
+        _stopped          = False
 
         while self._running:
+            _t0 = time.monotonic()
+
             if self._latest_human_state is not None:
                 if time.monotonic() - self._last_mocap_time <= _MOCAP_TIMEOUT_S:
-                    _stopped = False   # mocap is live again — re-arm stop
+                    _stopped = False
 
-                    # During classifier warm-up (buffer not full) keep the robot
-                    # standing by sending zero velocity — same as old system.
                     if self._gait_prediction is None:
                         CtrlInterface.walk(vx=0, vy=0, vrz=0)
                     else:
@@ -291,6 +357,13 @@ class TeleopNode(Node):
                             robot_pose.pose.orientation.z = float(quat[2])
                             robot_pose.pose.orientation.w = float(quat[3])
 
+                            from scipy.spatial.transform import Rotation as _R
+                            yaw = _R.from_quat([
+                                float(quat[0]), float(quat[1]),
+                                float(quat[2]), float(quat[3]),
+                            ]).as_euler('xyz')[2]
+
+                            # ── Mapper PD command (always computed) ───────────
                             cmd_vel = self.mapper.select_robot_command(
                                 gait_prediction = self._gait_prediction,
                                 confidence      = self._gait_confidence,
@@ -300,15 +373,7 @@ class TeleopNode(Node):
                             )
 
                             # ── CBF safety filter ─────────────────────────────
-                            # Intercept the translational command and deflect
-                            # the robot around any detected obstacles before
-                            # sending to the hardware.  vrz passes through.
                             if self._cbf_filter is not None:
-                                from scipy.spatial.transform import Rotation as _R
-                                yaw = _R.from_quat([
-                                    float(quat[0]), float(quat[1]),
-                                    float(quat[2]), float(quat[3]),
-                                ]).as_euler('xyz')[2]
                                 u_safe = self._cbf_filter.filter(
                                     u_perf_body = np.array(cmd_vel[:2],
                                                            dtype=np.float64),
@@ -317,19 +382,26 @@ class TeleopNode(Node):
                                     robot_yaw   = float(yaw),
                                     obstacles   = self._obstacles,
                                 )
-                                vx_cmd, vy_cmd = float(u_safe[0]), float(u_safe[1])
                             else:
-                                vx_cmd, vy_cmd = float(cmd_vel[0]), float(cmd_vel[1])
+                                u_safe = cmd_vel[:2].copy()
+
+                            # ── FSM update ────────────────────────────────────
+                            fsm_cmd = self._fsm_update(
+                                robot_pos = np.array(pos[:2], dtype=np.float64),
+                                robot_yaw = float(yaw),
+                                vel_body  = np.array(cmd_vel[:2], dtype=np.float64),
+                                u_safe    = u_safe,
+                                cmd_vel   = cmd_vel,
+                            )
+
+                            vx_cmd, vy_cmd = float(fsm_cmd[0]), float(fsm_cmd[1])
 
                             CtrlInterface.walk(
                                 vx  = vx_cmd,
                                 vy  = vy_cmd,
-                                vrz = float(cmd_vel[2]),
+                                vrz = float(fsm_cmd[2]),
                             )
 
-                            # Rotate commanded body velocity to world frame for
-                            # the velocity tracking metric.  Uses the commanded
-                            # (post-CBF) velocity as a proxy for actual robot vel.
                             _yaw = np.arctan2(
                                 2.0 * (quat[3] * quat[2] + quat[0] * quat[1]),
                                 1.0 - 2.0 * (quat[1]**2 + quat[2]**2))
@@ -337,7 +409,7 @@ class TeleopNode(Node):
                             robot_twist_msg = TwistStamped()
                             robot_twist_msg.twist.linear.x  = float(_c * vx_cmd - _s * vy_cmd)
                             robot_twist_msg.twist.linear.y  = float(_s * vx_cmd + _c * vy_cmd)
-                            robot_twist_msg.twist.angular.z = float(cmd_vel[2])
+                            robot_twist_msg.twist.angular.z = float(fsm_cmd[2])
 
                             self._metrics.log_frame(
                                 human_state = self._latest_human_state,
@@ -347,17 +419,113 @@ class TeleopNode(Node):
                             )
 
                             twist_msg           = Twist()
-                            twist_msg.linear.x  = float(cmd_vel[0])
-                            twist_msg.linear.y  = float(cmd_vel[1])
-                            twist_msg.angular.z = float(cmd_vel[2])
+                            twist_msg.linear.x  = float(fsm_cmd[0])
+                            twist_msg.linear.y  = float(fsm_cmd[1])
+                            twist_msg.angular.z = float(fsm_cmd[2])
                             self._cmd_vel_pub.publish(twist_msg)
-                            self._last_cmd_vel = cmd_vel
+                            self._last_cmd_vel = fsm_cmd
                             self._freq_pd.tick()
+
                 elif not _stopped:
                     CtrlInterface.soft_stop()
                     self.get_logger().info('Mocap stream ended — soft stop sent')
                     _stopped = True
                     rclpy.shutdown()
+
+            elapsed   = time.monotonic() - _t0
+            remaining = _target_dt - elapsed
+            if remaining > 0:
+                time.sleep(remaining)
+
+    # ── FSM logic ─────────────────────────────────────────────────────────────
+
+    def _fsm_update(
+        self,
+        robot_pos: np.ndarray,   # [x, y]
+        robot_yaw: float,
+        vel_body:  np.ndarray,   # [vx, vy] body frame
+        u_safe:    np.ndarray,   # CBF-filtered [vx, vy]
+        cmd_vel:   np.ndarray,   # full [vx, vy, vrz] from mapper
+    ) -> np.ndarray:             # [vx_body, vy_body, vrz] to send
+        """Run one FSM tick and return the velocity command to execute."""
+
+        # FSM disabled — pure imitation.
+        if self._feasibility is None:
+            return np.array([u_safe[0], u_safe[1], cmd_vel[2]])
+
+        human_xy  = self.mapper.human_pos[:2].copy()
+        obstacles = self._obstacles
+
+        # ── Evaluate Q ───────────────────────────────────────────────────────
+        q = self._feasibility.q_value(
+            robot_pos  = robot_pos,
+            robot_yaw  = robot_yaw,
+            vel_body   = vel_body,
+            goal_xy    = human_xy,
+            obstacles  = obstacles,
+            u_safe     = u_safe,
+        )
+
+        dist_to_human = np.linalg.norm(human_xy - robot_pos)
+
+        # ── State transitions ────────────────────────────────────────────────
+        prev_mode = self._fsm_mode
+
+        if self._fsm_mode == TeleopMode.IMITATE:
+            if q < _Q_LOW:
+                self._fsm_low_q_count += 1
+                if self._fsm_low_q_count >= _FSM_CONFIRM_FRAMES:
+                    self._fsm_mode        = TeleopMode.PLAN
+                    self._fsm_low_q_count = 0
+                    self._mppi.reset()
+                    self.get_logger().info(
+                        f'FSM IMITATE→PLAN  Q={q:.2f}')
+            else:
+                self._fsm_low_q_count = 0
+
+        elif self._fsm_mode == TeleopMode.PLAN:
+            if q > _Q_HIGH:
+                self._fsm_mode = TeleopMode.RESYNC
+                self.get_logger().info(
+                    f'FSM PLAN→RESYNC  Q={q:.2f}')
+
+        elif self._fsm_mode == TeleopMode.RESYNC:
+            if dist_to_human < _RESYNC_DIST_M:
+                self._fsm_mode        = TeleopMode.IMITATE
+                self._fsm_low_q_count = 0
+                self.get_logger().info(
+                    f'FSM RESYNC→IMITATE  dist={dist_to_human:.2f} m')
+            elif q < _Q_LOW:
+                self._fsm_mode = TeleopMode.PLAN
+                self.get_logger().info(
+                    f'FSM RESYNC→PLAN  Q={q:.2f}')
+
+        if prev_mode != self._fsm_mode:
+            self._mode_pub.publish(String(data=self._fsm_mode.value))
+
+        # ── Generate command ─────────────────────────────────────────────────
+        if self._fsm_mode == TeleopMode.IMITATE:
+            return np.array([u_safe[0], u_safe[1], cmd_vel[2]])
+
+        # PLAN or RESYNC: use MPPI.
+        mppi_cmd = self._mppi.compute(
+            robot_pos = robot_pos,
+            robot_yaw = robot_yaw,
+            goal_xy   = human_xy,
+            grid      = self._costmap,   # None is safe — obstacle term skipped
+        )
+
+        # Still run CBF on the MPPI output for safety.
+        if self._cbf_filter is not None:
+            mp_safe = self._cbf_filter.filter(
+                u_perf_body = np.array(mppi_cmd[:2], dtype=np.float64),
+                robot_pos   = robot_pos,
+                robot_yaw   = robot_yaw,
+                obstacles   = obstacles,
+            )
+            return np.array([mp_safe[0], mp_safe[1], mppi_cmd[2]])
+
+        return mppi_cmd
 
     # ── Frequency logging (1 Hz) ──────────────────────────────────────────────
 
@@ -381,11 +549,13 @@ class TeleopNode(Node):
             stats   = self._cbf_filter.reset_counters()
             cbf_str = (f'  cbf={stats["filter_pct"]:.0f}%active'
                        f'  obs={len(self._obstacles)}')
+        fsm_str = (f'  fsm={self._fsm_mode.value}'
+                   if self._feasibility is not None else '')
         self.get_logger().info(
             f'[freq] mocap={mocap_hz:.1f} Hz  '
             f'classifier={classifier_hz:.1f} Hz  '
             f'pd_ctrl={pd_hz:.1f} Hz  '
-            f'gait={gait_str}  cmd={cmd_str}{cbf_str}'
+            f'gait={gait_str}  cmd={cmd_str}{cbf_str}{fsm_str}'
         )
 
     # ── Shutdown ──────────────────────────────────────────────────────────────
@@ -404,10 +574,6 @@ class TeleopNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = TeleopNode()
-    # SingleThreadedExecutor: only trivial callbacks remain in the executor
-    # (subscriber + 1 Hz log timer).  All heavy work is in Python threads.
-    # This eliminates MultiThreadedExecutor mutex contention that was limiting
-    # the subscriber to ~17 Hz instead of 240 Hz.
     executor = SingleThreadedExecutor()
     executor.add_node(node)
     try:

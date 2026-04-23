@@ -49,14 +49,14 @@ class MotionMapper:
         self.offset_initialized = False
 
         # ── Control gains ─────────────────────────────────────────────────────
-        # Kp:     proportional — at 0.5 m error commands 0.5 m/s before D term.
-        # Kd:     derivative   — adds velocity feedforward; Kd=0.3 means human
-        #         walking at 1.5 m/s contributes +0.45 m/s to the command.
+        # Kp:     proportional — at 0.5 m error commands 2.0 m/s before D term.
+        # Kd:     derivative   — adds velocity feedforward; Kd=0.4 means human
+        #         walking at 1.3 m/s contributes +0.52 m/s to the command.
         # Kp_ang: angular proportional.
         # Kd_ang: angular derivative — damps heading oscillation.
-        self.Kp     = 3.0   # m/s per m  — saturates to walk cap at ~0.43 m error
-        self.Kd     = 0.3   # m/s per m/s — velocity feedforward
-        self.Kp_ang = 1.5   # rad/s per rad
+        self.Kp     = 3.5   # m/s per m  — saturates to walk cap at ~0.43 m error
+        self.Kd     = 0.4   # m/s per m/s — velocity feedforward
+        self.Kp_ang = 2.0   # rad/s per rad
         # Kd_ang is now a feedforward gain on the human's direct angular rate
         # (from root_twist.angular.z) rather than a finite-difference derivative
         # of heading error.  The overall loop remains feedback-controlled via
@@ -69,13 +69,17 @@ class MotionMapper:
         # ── Velocity limits ───────────────────────────────────────────────────
         # MAX_LINEAR_VEL: absolute cap across all gaits; used by the CBF filter.
         # MAX_VEL_BY_GAIT: per-gait cap applied inside compute_cmd_vel.
-        self.MAX_LINEAR_VEL  = 2.5   # m/s — Go2 jog ceiling
-        self.MAX_ANGULAR_VEL = 2.5   # rad/s — raised to track jogging turns
+        self.MAX_LINEAR_VEL  = 3.7   # m/s — Go2 nominal max forward speed
+        self.MAX_ANGULAR_VEL = 1.5   # rad/s — Go2 nominal max yaw rate
         self.MAX_VEL_BY_GAIT = {
             'stand': 1.0,   # enough to close gaps during brief stand phases
-            'walk':  1.5,   # above typical human walking speed (~1.2 m/s)
-            'jog':   2.5,   # Go2 jog ceiling
+            'walk':  2.0,   # human walks ~1.3 m/s; headroom for gap closing
+            'jog':   3.0,   # human jogs ~2-3 m/s; headroom without hitting hardware max
         }
+        # Go2 lateral (vy body-frame) capability is much weaker than forward.
+        # Hardware clips at 0.6 m/s internally — cap here too so the command
+        # ratio is not distorted when the robot needs to move diagonally.
+        self.MAX_LATERAL_VEL = 0.6   # m/s — Go2 nominal max lateral speed
 
         # ── Dead-zones — suppress chatter when essentially co-located ─────────
         self.POSITION_TOLERANCE = 0.05          # m
@@ -95,7 +99,7 @@ class MotionMapper:
         # inherent following lag during constant-velocity motion.
         # Uses root_twist from the mocap driver (finite-differenced at 240 Hz)
         # — cleaner than differentiating the position error ourselves.
-        self.LOOKAHEAD_S  = 0.2          # seconds; tune between 0.1–0.5
+        self.LOOKAHEAD_S  = 0.25         # seconds; tune between 0.1–0.5
         self.human_vel    = np.zeros(2)  # [vx, vy] world frame, updated each call
 
         # ── Internal state [x, y, yaw] ────────────────────────────────────────
@@ -110,6 +114,7 @@ class MotionMapper:
         self._prev_ex:           float | None = None
         self._prev_ey:           float | None = None
         self._last_compute_time: float | None = None
+
 
 
     # ── State updates ─────────────────────────────────────────────────────────
@@ -220,7 +225,12 @@ class MotionMapper:
         vel_body = self._world_to_body(
             np.array([vx_world, vy_world]), self.robot_pos[2])
 
-        return np.array([vel_body[0], vel_body[1], vrz]), distance_error, heading_error
+        # Clamp lateral velocity to hardware limit — the Go2 is much less
+        # stable moving sideways than forward; mpac clips internally anyway
+        # but capping here keeps the vx/vy ratio from being distorted.
+        vy_clamped = np.clip(vel_body[1], -self.MAX_LATERAL_VEL, self.MAX_LATERAL_VEL)
+
+        return np.array([vel_body[0], vy_clamped, vrz]), distance_error, heading_error
 
     def select_gait(self, gait_prediction: str, confidence: float | None) -> str:
         if confidence is None or confidence < self.CONFIDENCE_THRESHOLD:
@@ -264,7 +274,11 @@ class MotionMapper:
         # human faces North, the robot faces North, independent of their starting headings).
         if not self.offset_initialized:
             self.coordinate_offset[:] = self.robot_pos - self.human_pos
-            self.coordinate_offset[2] = 0.0   # absolute heading alignment
+            # coordinate_offset[2] is the yaw offset between mocap and odom frames.
+            # Including it means heading error starts at zero and the controller
+            # tracks heading changes rather than absolute compass direction —
+            # the robot still fully mimics the human's heading, without spending
+            # the first frames correcting an artificial frame-misalignment artifact.
             self.human_pos[0] += self.coordinate_offset[0]
             self.human_pos[1] += self.coordinate_offset[1]
             self.human_pos[2]  = self._normalize_angle(

@@ -1,0 +1,154 @@
+overall:
+  duration_seconds: 13.829166666666666
+  total_frames: 3319
+  num_gait_transitions: 2
+position_tracking:
+  mean_m: 0.10420474027203752
+  std_m: 0.051497989866282436
+  median_m: 0.11177384000877962
+  max_m: 0.18529186823028138
+  rmse_m: 0.11623541136603134
+  p95_m: 0.17162744330543117
+  p99_m: 0.18215196615677634
+  accuracy_5cm_pct: 21.6932811087677
+  accuracy_10cm_pct: 45.82705634227177
+  accuracy_20cm_pct: 100.0
+  norm_error_mean_pct: 18.359191269974318
+  norm_error_median_pct: 7.167404473230928
+velocity_tracking:
+  mean_ms: 1.2469274139191748
+  std_ms: 0.9105895649531551
+  median_ms: 1.3160591211396884
+  max_ms: 3.1226645415728878
+  rmse_ms: 1.5440211563915625
+  accuracy_01ms_pct: 17.324495329918648
+  accuracy_02ms_pct: 19.88550768303706
+  accuracy_05ms_pct: 27.65893341367882
+heading_tracking:
+  mean_deg: 2.9844898664342248
+  std_deg: 1.7987360092808349
+  max_deg: 6.898763677580139
+  rmse_deg: 3.4846278128276658
+  accuracy_5deg_pct: 82.70563422717686
+  accuracy_10deg_pct: 100.0
+  accuracy_20deg_pct: 100.0
+joint_tracking:
+  pos20cm_head10deg_pct: 100.0
+  pos10cm_head5deg_pct: 38.89725821030431
+  pos20cm_head5deg_pct: 82.70563422717686
+gait_transitions:
+- time_s: 6.434198379516602
+  from: !!python/object/apply:numpy._core.multiarray.scalar
+  - !!python/object/apply:numpy.dtype
+    args:
+    - U4
+    - false
+    - true
+    state: !!python/tuple
+    - 3
+    - <
+    - null
+    - null
+    - null
+    - 16
+    - 4
+    - 8
+  - !!binary |
+    dwAAAGEAAABsAAAAawAAAA==
+  to: !!python/object/apply:numpy._core.multiarray.scalar
+  - !!python/object/apply:numpy.dtype
+    args:
+    - U3
+    - false
+    - true
+    state: !!python/tuple
+    - 3
+    - <
+    - null
+    - null
+    - null
+    - 12
+    - 4
+    - 8
+  - !!binary |
+    agAAAG8AAABnAAAA
+- time_s: 7.435181140899658
+  from: !!python/object/apply:numpy._core.multiarray.scalar
+  - !!python/object/apply:numpy.dtype
+    args:
+    - U3
+    - false
+    - true
+    state: !!python/tuple
+    - 3
+    - <
+    - null
+    - null
+    - null
+    - 12
+    - 4
+    - 8
+  - !!binary |
+    agAAAG8AAABnAAAA
+  to: !!python/object/apply:numpy._core.multiarray.scalar
+  - !!python/object/apply:numpy.dtype
+    args:
+    - U4
+    - false
+    - true
+    state: !!python/tuple
+    - 3
+    - <
+    - null
+    - null
+    - null
+    - 16
+    - 4
+    - 8
+  - !!binary |
+    dwAAAGEAAABsAAAAawAAAA==
+per_gait:
+  walk:
+    frames: 2836
+    duration_s: 11.816666666666666
+    position_rmse_m: 0.12477466360051016
+    position_mean_m: 0.11577914495764145
+    velocity_rmse_ms: 1.6697981782239857
+    heading_rmse_deg: 3.528788624458713
+    pos_10cm_pct: 36.60084626234132
+    joint_pos20cm_head10deg_pct: 100.0
+    joint_pos10cm_head5deg_pct: 28.49083215796897
+  jog:
+    frames: 483
+    duration_s: 2.0125
+    position_rmse_m: 0.03777003737280902
+    position_mean_m: 0.03624405354662814
+    velocity_rmse_ms: 0.1026724439389498
+    heading_rmse_deg: 3.213110456176702
+    pos_10cm_pct: 100.0
+    joint_pos20cm_head10deg_pct: 100.0
+    joint_pos10cm_head5deg_pct: 100.0
+component_frequency:
+  mocap:
+    nominal_hz: 240.0
+    mean_hz: 240.01346879596548
+    std_hz: 0.04102316904893539
+    min_hz: 239.93752375882826
+    max_hz: 240.06921268111032
+    within_5pct: 100.0
+  classifier:
+    nominal_hz: 20.0
+    mean_hz: 20.479804736220526
+    std_hz: 0.671208275293305
+    min_hz: 19.963568439591082
+    max_hz: 22.040482088468963
+    within_5pct: 85.71428571428571
+  pd_ctrl:
+    nominal_hz: 500.0
+    mean_hz: 479.82062275011106
+    std_hz: 1.6138993566245847
+    min_hz: 476.1980486331439
+    max_hz: 481.7647257980367
+    within_5pct: 100.0
+  num_samples: 7
+  duration_s: 7.0041093826293945

@@ -1,0 +1,71 @@
+================================================================================
+TELEOP PERFORMANCE METRICS SUMMARY
+================================================================================
+
+OVERALL:
+----------------------------------------
+  Duration:          76.00 s
+  Frames:            18239
+  Gait transitions:  14
+
+POSITION:
+----------------------------------------
+  Mean ± Std:  35.11 ± 53.49 cm
+  RMSE:        63.98 cm
+  Median:      17.72 cm
+  Max:         242.76 cm
+  ≤ 5 cm:      3.9%
+  ≤ 10 cm:     13.0%
+  ≤ 20 cm:     67.6%
+
+VELOCITY:
+----------------------------------------
+  Mean ± Std:  0.576 ± 1.650 m/s
+  RMSE:        1.748 m/s
+  ≤ 0.1 m/s:   13.0%
+  ≤ 0.2 m/s:   38.3%
+
+HEADING:
+----------------------------------------
+  Mean ± Std:  18.41 ± 20.92°
+  RMSE:        27.87°
+  ≤ 5°:        15.8%
+  ≤ 10°:       50.8%
+
+PER-GAIT:
+----------------------------------------
+  STAND (8.1s, 1937 frames)
+    Pos RMSE: 123.71 cm  Vel RMSE: 0.618 m/s  Head RMSE: 42.73°
+    ≤10cm: 20.7%
+  WALK (56.8s, 13634 frames)
+    Pos RMSE: 56.92 cm  Vel RMSE: 0.706 m/s  Head RMSE: 25.88°
+    ≤10cm: 3.6%
+  JOG (11.1s, 2668 frames)
+    Pos RMSE: 17.68 cm  Vel RMSE: 4.250 m/s  Head RMSE: 23.69°
+    ≤10cm: 55.5%
+
+TRANSITIONS:
+----------------------------------------
+  t=1.51s: jog → walk
+  t=5.32s: walk → jog
+  t=6.72s: jog → walk
+  t=10.33s: walk → jog
+  t=12.33s: jog → walk
+  t=19.60s: walk → stand
+  t=20.60s: stand → walk
+  t=25.45s: walk → stand
+  t=26.45s: stand → walk
+  t=28.96s: walk → stand
+  t=29.96s: stand → walk
+  t=31.97s: walk → jog
+  t=33.17s: jog → walk
+  t=37.68s: walk → stand
+
+COMPONENT FREQUENCY:
+----------------------------------------
+  Samples logged: 38  (over 38.0 s)
+  Mocap        nominal=240 Hz  mean=240.0  std=0.0  min=240.0  max=240.1  within±5%=100.0%
+  Classifier   nominal=20 Hz  mean=20.0  std=0.3  min=20.0  max=21.8  within±5%=97.4%
+  PD Ctrl      nominal=500 Hz  mean=477.0  std=5.2  min=458.6  max=481.5  within±5%=81.6%
+
+================================================================================

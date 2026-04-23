@@ -1,0 +1,84 @@
+================================================================================
+TELEOP PERFORMANCE METRICS SUMMARY
+================================================================================
+
+OVERALL:
+----------------------------------------
+  Duration:          68.99 s
+  Frames:            16558
+  Gait transitions:  19
+
+POSITION:
+----------------------------------------
+  Mean ± Std:  57.11 ± 72.42 cm
+  RMSE:        92.22 cm
+  Median:      16.21 cm
+  Max:         240.25 cm
+  ≤ 5 cm:      7.7%
+  ≤ 10 cm:     20.8%
+  ≤ 20 cm:     57.9%
+  Norm error (mean):    55.1% of displacement
+  Norm error (median):  13.8% of displacement
+
+VELOCITY:
+----------------------------------------
+  Mean ± Std:  0.974 ± 4.010 m/s
+  RMSE:        4.126 m/s
+  ≤ 0.1 m/s:   8.4%
+  ≤ 0.2 m/s:   22.4%
+
+HEADING:
+----------------------------------------
+  Mean ± Std:  30.96 ± 43.35°
+  RMSE:        53.27°
+  ≤ 5°:        20.0%
+  ≤ 10°:       49.0%
+
+JOINT TRACKING (position AND heading):
+----------------------------------------
+  ≤20 cm & ≤10°:  41.7%
+  ≤20 cm &  ≤5°:  17.0%
+  ≤10 cm &  ≤5°:  4.4%
+
+PER-GAIT:
+----------------------------------------
+  STAND (9.4s, 2263 frames)
+    Pos RMSE: 46.19 cm  Vel RMSE: 0.436 m/s  Head RMSE: 30.78°
+    ≤10cm: 60.4%  Joint(≤20cm&≤10°): 67.0%  Joint(≤10cm&≤5°): 19.9%
+  WALK (41.5s, 9953 frames)
+    Pos RMSE: 99.05 cm  Vel RMSE: 1.129 m/s  Head RMSE: 51.12°
+    ≤10cm: 7.6%  Joint(≤20cm&≤10°): 49.6%  Joint(≤10cm&≤5°): 1.2%
+  JOG (18.1s, 4342 frames)
+    Pos RMSE: 93.99 cm  Vel RMSE: 7.868 m/s  Head RMSE: 65.86°
+    ≤10cm: 30.5%  Joint(≤20cm&≤10°): 10.5%  Joint(≤10cm&≤5°): 3.8%
+
+TRANSITIONS:
+----------------------------------------
+  t=2.04s: stand → walk
+  t=4.54s: walk → jog
+  t=5.54s: jog → walk
+  t=7.35s: walk → stand
+  t=8.35s: stand → walk
+  t=9.70s: walk → stand
+  t=10.70s: stand → jog
+  t=12.30s: jog → walk
+  t=16.56s: walk → jog
+  t=17.86s: jog → walk
+  t=21.57s: walk → stand
+  t=22.57s: stand → walk
+  t=23.57s: walk → jog
+  t=26.73s: jog → walk
+  t=29.23s: walk → jog
+  t=30.24s: jog → walk
+  t=31.74s: walk → jog
+  t=32.74s: jog → walk
+  t=34.89s: walk → stand
+
+COMPONENT FREQUENCY:
+----------------------------------------
+  Samples logged: 35  (over 35.0 s)
+  Mocap        nominal=240 Hz  mean=240.0  std=0.1  min=239.9  max=240.2  within±5%=100.0%
+  Classifier   nominal=20 Hz  mean=20.1  std=0.3  min=20.0  max=21.8  within±5%=97.1%
+  PD Ctrl      nominal=500 Hz  mean=478.6  std=3.7  min=460.9  max=481.2  within±5%=88.6%
+
+================================================================================

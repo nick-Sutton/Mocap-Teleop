@@ -1,0 +1,109 @@
+overall:
+  duration_seconds: 12.504166666666666
+  total_frames: 3001
+  num_gait_transitions: 1
+position_tracking:
+  mean_m: 0.14549157422294207
+  std_m: 0.07872704694057545
+  median_m: 0.15406834876327832
+  max_m: 0.320819445655393
+  rmse_m: 0.16542595349537337
+  p95_m: 0.27212886713021
+  p99_m: 0.31539748527209
+  accuracy_5cm_pct: 20.993002332555815
+  accuracy_10cm_pct: 29.39020326557814
+  accuracy_20cm_pct: 75.14161946017994
+velocity_tracking:
+  mean_ms: 0.3199914066576008
+  std_ms: 0.34464874580331467
+  median_ms: 0.15773340944183908
+  max_ms: 2.2859467724949405
+  rmse_ms: 0.4702948631640663
+  accuracy_01ms_pct: 41.25291569476841
+  accuracy_02ms_pct: 52.582472509163615
+  accuracy_05ms_pct: 71.20959680106631
+heading_tracking:
+  mean_deg: 10.500821245890457
+  std_deg: 16.363612132375746
+  max_deg: 69.69640927933854
+  rmse_deg: 19.443123433671328
+  accuracy_5deg_pct: 60.313228923692094
+  accuracy_10deg_pct: 79.07364211929357
+  accuracy_20deg_pct: 85.8713762079307
+gait_transitions:
+- time_s: 5.381699323654175
+  from: !!python/object/apply:numpy._core.multiarray.scalar
+  - !!python/object/apply:numpy.dtype
+    args:
+    - U4
+    - false
+    - true
+    state: !!python/tuple
+    - 3
+    - <
+    - null
+    - null
+    - null
+    - 16
+    - 4
+    - 8
+  - !!binary |
+    dwAAAGEAAABsAAAAawAAAA==
+  to: !!python/object/apply:numpy._core.multiarray.scalar
+  - !!python/object/apply:numpy.dtype
+    args:
+    - U5
+    - false
+    - true
+    state: !!python/tuple
+    - 3
+    - <
+    - null
+    - null
+    - null
+    - 20
+    - 4
+    - 8
+  - !!binary |
+    cwAAAHQAAABhAAAAbgAAAGQAAAA=
+per_gait:
+  stand:
+    frames: 675
+    duration_s: 2.8125
+    position_rmse_m: 0.04573424443118106
+    position_mean_m: 0.04244183318024249
+    velocity_rmse_ms: 0.24191153323935555
+    heading_rmse_deg: 4.139609774739621
+    pos_10cm_pct: 100.0
+  walk:
+    frames: 2326
+    duration_s: 9.691666666666666
+    position_rmse_m: 0.18628000605315326
+    position_mean_m: 0.1753963786957805
+    velocity_rmse_ms: 0.5180537479218913
+    heading_rmse_deg: 21.971960288102945
+    pos_10cm_pct: 8.899398108340499
+component_frequency:
+  mocap:
+    nominal_hz: 240.0
+    mean_hz: 239.99530343917812
+    std_hz: 0.013445280447082432
+    min_hz: 239.9797177866306
+    max_hz: 240.01952100584285
+    within_5pct: 100.0
+  classifier:
+    nominal_hz: 20.0
+    mean_hz: 20.538778332566483
+    std_hz: 0.634883076874048
+    min_hz: 19.964766542999254
+    max_hz: 21.8919988883642
+    within_5pct: 83.33333333333334
+  pd_ctrl:
+    nominal_hz: 500.0
+    mean_hz: 479.25051030244117
+    std_hz: 1.5896322295611245
+    min_hz: 475.79515884329163
+    max_hz: 480.43551799846404
+    within_5pct: 100.0
+  num_samples: 6
+  duration_s: 6.0345704555511475

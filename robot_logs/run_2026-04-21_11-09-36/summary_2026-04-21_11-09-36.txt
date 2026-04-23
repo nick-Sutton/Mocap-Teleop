@@ -1,0 +1,63 @@
+================================================================================
+TELEOP PERFORMANCE METRICS SUMMARY
+================================================================================
+
+OVERALL:
+----------------------------------------
+  Duration:          13.80 s
+  Frames:            3311
+  Gait transitions:  1
+
+POSITION:
+----------------------------------------
+  Mean ± Std:  8.51 ± 3.90 cm
+  RMSE:        9.36 cm
+  Median:      7.97 cm
+  Max:         15.95 cm
+  ≤ 5 cm:      19.0%
+  ≤ 10 cm:     66.5%
+  ≤ 20 cm:     100.0%
+  Norm error (mean):    16.0% of displacement
+  Norm error (median):  4.9% of displacement
+
+VELOCITY:
+----------------------------------------
+  Mean ± Std:  1.321 ± 0.953 m/s
+  RMSE:        1.629 m/s
+  ≤ 0.1 m/s:   13.5%
+  ≤ 0.2 m/s:   18.1%
+
+HEADING:
+----------------------------------------
+  Mean ± Std:  3.04 ± 1.85°
+  RMSE:        3.56°
+  ≤ 5°:        80.6%
+  ≤ 10°:       100.0%
+
+JOINT TRACKING (position AND heading):
+----------------------------------------
+  ≤20 cm & ≤10°:  100.0%
+  ≤20 cm &  ≤5°:  80.6%
+  ≤10 cm &  ≤5°:  52.1%
+
+PER-GAIT:
+----------------------------------------
+  WALK (11.8s, 2833 frames)
+    Pos RMSE: 9.94 cm  Vel RMSE: 1.760 m/s  Head RMSE: 3.62°
+    ≤10cm: 60.9%  Joint(≤20cm&≤10°): 100.0%  Joint(≤10cm&≤5°): 44.0%
+  JOG (2.0s, 478 frames)
+    Pos RMSE: 4.68 cm  Vel RMSE: 0.126 m/s  Head RMSE: 3.20°
+    ≤10cm: 100.0%  Joint(≤20cm&≤10°): 100.0%  Joint(≤10cm&≤5°): 100.0%
+
+TRANSITIONS:
+----------------------------------------
+  t=6.38s: walk → jog
+
+COMPONENT FREQUENCY:
+----------------------------------------
+  Samples logged: 7  (over 7.0 s)
+  Mocap        nominal=240 Hz  mean=240.0  std=0.0  min=240.0  max=240.1  within±5%=100.0%
+  Classifier   nominal=20 Hz  mean=20.5  std=0.6  min=20.0  max=21.9  within±5%=85.7%
+  PD Ctrl      nominal=500 Hz  mean=480.7  std=2.8  min=475.7  max=485.8  within±5%=100.0%
+
+================================================================================

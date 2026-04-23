@@ -1,0 +1,64 @@
+================================================================================
+TELEOP PERFORMANCE METRICS SUMMARY
+================================================================================
+
+OVERALL:
+----------------------------------------
+  Duration:          12.55 s
+  Frames:            3013
+  Gait transitions:  2
+
+POSITION:
+----------------------------------------
+  Mean ± Std:  25.22 ± 14.14 cm
+  RMSE:        28.92 cm
+  Median:      29.93 cm
+  Max:         42.93 cm
+  ≤ 5 cm:      12.8%
+  ≤ 10 cm:     26.3%
+  ≤ 20 cm:     35.1%
+  Norm error (mean):    25.1% of displacement
+  Norm error (median):  18.4% of displacement
+
+VELOCITY:
+----------------------------------------
+  Mean ± Std:  1.033 ± 0.595 m/s
+  RMSE:        1.192 m/s
+  ≤ 0.1 m/s:   9.3%
+  ≤ 0.2 m/s:   11.9%
+
+HEADING:
+----------------------------------------
+  Mean ± Std:  2.88 ± 1.60°
+  RMSE:        3.29°
+  ≤ 5°:        94.2%
+  ≤ 10°:       100.0%
+
+JOINT TRACKING (position AND heading):
+----------------------------------------
+  ≤20 cm & ≤10°:  35.1%
+  ≤20 cm &  ≤5°:  33.9%
+  ≤10 cm &  ≤5°:  25.1%
+
+PER-GAIT:
+----------------------------------------
+  STAND (2.9s, 684 frames)
+    Pos RMSE: 9.38 cm  Vel RMSE: 0.408 m/s  Head RMSE: 3.98°
+    ≤10cm: 75.4%  Joint(≤20cm&≤10°): 96.3%  Joint(≤10cm&≤5°): 70.3%
+  WALK (9.7s, 2329 frames)
+    Pos RMSE: 32.50 cm  Vel RMSE: 1.338 m/s  Head RMSE: 3.06°
+    ≤10cm: 11.9%  Joint(≤20cm&≤10°): 17.1%  Joint(≤10cm&≤5°): 11.9%
+
+TRANSITIONS:
+----------------------------------------
+  t=0.53s: stand → walk
+  t=5.39s: walk → stand
+
+COMPONENT FREQUENCY:
+----------------------------------------
+  Samples logged: 6  (over 6.0 s)
+  Mocap        nominal=240 Hz  mean=240.0  std=0.0  min=239.9  max=240.1  within±5%=100.0%
+  Classifier   nominal=20 Hz  mean=20.6  std=0.7  min=20.0  max=22.1  within±5%=83.3%
+  PD Ctrl      nominal=500 Hz  mean=479.8  std=0.5  min=479.0  max=480.6  within±5%=100.0%
+
+================================================================================

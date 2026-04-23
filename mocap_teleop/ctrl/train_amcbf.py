@@ -66,16 +66,17 @@ from mocap_teleop.ctrl.ctrl_interface import CtrlInterface
 
 # ── Hyperparameters ───────────────────────────────────────────────────────────
 
-_V_MAX          = 1.5      # m/s — nominal walk speed cap
-_KP_NOMINAL     = 1.5      # P-gain for goal-reaching nominal policy
-_KP_YAW         = 2.0      # P-gain for heading controller (rad/s per rad)
-_VRZ_MAX        = 1.2      # max yaw rate (rad/s)
+_V_MAX          = 0.6      # m/s — nominal walk speed cap
+_KP_NOMINAL     = 0.8      # P-gain for goal-reaching nominal policy
+_KP_YAW         = 1.5      # P-gain for heading controller (rad/s per rad)
+_VRZ_MAX        = 1.0      # rad/s — max yaw rate
 _SAFETY_WEIGHT  = 10.0     # reward penalty weight for h < 0 violations
                            #   distance reward is in [-1,0]/step; weight=10 makes
                            #   safety the dominant term so κ learns conservatism
 _GOAL_BONUS     = 5.0      # one-time reward for reaching the goal
 _STEP_PENALTY   = 0.005    # constant per-step cost (encourages minimum-time)
-_MAX_OBS        = 3        # max obstacles per episode
+_MAX_OBS             = 3        # max obstacles per episode
+_BLOCKED_EPISODE_FRAC = 0.35   # fraction of episodes that use blocked layout
 _ARENA_HALF     = 3.0      # half-width of square sampling arena (m)
 _OBS_R_MIN      = 0.3      # min obstacle radius (m)
 _OBS_R_MAX      = 0.8      # max obstacle radius (m)
@@ -339,6 +340,59 @@ def _sample_episode(
     return start, goal, [Obstacle(center=center, radius=r)]
 
 
+def _sample_blocked_episode(
+    arena_half:  float = _ARENA_HALF,
+    min_sg_dist: float = _MIN_SG_DIST,
+) -> Tuple[np.ndarray, np.ndarray, List[Obstacle]]:
+    """
+    Sample an episode where a wall of overlapping obstacles fully blocks the
+    direct path between start and goal.
+
+    The nominal P-controller aims straight at the goal; the CBF stops it at
+    the wall.  With no way through, distance stays large and reward accumulates
+    very negative — teaching the critic that Q is low in this configuration.
+
+    Wall layout: MAX_OBS obstacles of radius _WALL_R placed perpendicular to
+    the start→goal vector, centres spaced _WALL_SPACING apart.  Because
+    _WALL_SPACING < 2 * _WALL_R the obstacles overlap, leaving no gap.
+    """
+    _WALL_R       = 0.7    # m — large enough that 3 obstacles span the arena width
+    _WALL_SPACING = 1.0    # m — centre-to-centre; < 2*_WALL_R so gaps are sealed
+    _SAFE_MARGIN  = 0.5    # m — start/goal must clear all obstacles by this margin
+
+    for _ in range(2000):
+        start = np.random.uniform(-arena_half + 0.5, arena_half - 0.5, 2)
+        goal  = np.random.uniform(-arena_half + 0.5, arena_half - 0.5, 2)
+        if np.linalg.norm(goal - start) >= min_sg_dist:
+            break
+
+    path_vec  = goal - start
+    path_dir  = path_vec / (np.linalg.norm(path_vec) + 1e-8)
+    path_perp = np.array([-path_dir[1], path_dir[0]])
+
+    # Place wall at a random position 35-65% along the path
+    t_wall      = np.random.uniform(0.35, 0.65)
+    wall_center = start + t_wall * path_vec
+
+    # Centre obstacle on path; offset remaining two symmetrically either side
+    offsets   = np.arange(_MAX_OBS) - (_MAX_OBS - 1) / 2.0
+    obstacles = [
+        Obstacle(
+            center = wall_center + off * _WALL_SPACING * path_perp,
+            radius = _WALL_R,
+        )
+        for off in offsets
+    ]
+
+    # Verify start and goal are safely clear; if not, fall back to free episode
+    for obs in obstacles:
+        if (cbf_value(start, obs.center, 0.0, obs.radius) <= _SAFE_MARGIN or
+                cbf_value(goal,  obs.center, 0.0, obs.radius) <= _SAFE_MARGIN):
+            return _sample_episode(arena_half=arena_half, min_sg_dist=min_sg_dist)
+
+    return start, goal, obstacles
+
+
 def _pack_obs(obstacles: List[Obstacle]) -> Tuple[np.ndarray, np.ndarray]:
     """Pack obstacle list into fixed-size arrays (padded to MAX_OBS)."""
     centers = np.zeros((_MAX_OBS, 2))
@@ -421,16 +475,25 @@ def train(
     opt_critic   = optim.Adam(critic.parameters(),    lr=_LR_CRITIC)
 
     # ── Resume from checkpoint ────────────────────────────────────────────────
+    # Two formats are supported:
+    #   Full checkpoint dict : keys 'kappa_net', 'critic', 'critic_tgt', ...
+    #   kappa_net.save() file: raw state dict (no 'kappa_net' key)
     start_ep = 0
     if resume_from and os.path.isfile(resume_from):
         ckpt = torch.load(resume_from, map_location=device)
-        kappa_net.load_state_dict(ckpt['kappa_net'])
-        critic.load_state_dict(ckpt['critic'])
-        critic_tgt.load_state_dict(ckpt['critic_tgt'])
-        opt_kappa.load_state_dict(ckpt['opt_kappa'])
-        opt_critic.load_state_dict(ckpt['opt_critic'])
-        start_ep = ckpt.get('episode', 0)
-        print(f'[resume] loaded checkpoint from {resume_from}  (ep {start_ep})')
+        if isinstance(ckpt, dict) and 'kappa_net' in ckpt:
+            kappa_net.load_state_dict(ckpt['kappa_net'])
+            critic.load_state_dict(ckpt['critic'])
+            critic_tgt.load_state_dict(ckpt['critic_tgt'])
+            opt_kappa.load_state_dict(ckpt['opt_kappa'])
+            opt_critic.load_state_dict(ckpt['opt_critic'])
+            start_ep = ckpt.get('episode', 0)
+            print(f'[resume] loaded full checkpoint from {resume_from}  (ep {start_ep})')
+        else:
+            # Legacy kappa_net.save() format — kappa weights only, fresh critic
+            kappa_net.load_state_dict(ckpt)
+            print(f'[resume] loaded kappa_net weights from {resume_from}  '
+                  f'(critic starts fresh)')
     elif resume_from:
         print(f'[resume] checkpoint not found: {resume_from} — starting fresh')
 
@@ -461,8 +524,12 @@ def train(
         sigma = _OU_SIGMA_START + (_OU_SIGMA_END - _OU_SIGMA_START) * ep / max(n_episodes - 1, 1)
         ou_noise.set_sigma(sigma)
 
-        # Sample new episode geometry
-        start, goal, obstacles = _sample_episode()
+        # Sample new episode geometry — mix blocked and free layouts so the
+        # critic learns both high-Q (reachable) and low-Q (blocked) states.
+        if random.random() < _BLOCKED_EPISODE_FRAC:
+            start, goal, obstacles = _sample_blocked_episode()
+        else:
+            start, goal, obstacles = _sample_episode()
         obs_centers, obs_radii = _pack_obs(obstacles)
         env.set_vis_obstacles(obstacles)
         env.set_vis_goal(goal)
@@ -619,6 +686,18 @@ def train(
     ctrl.soft_stop()
     env.close()
     kappa_net.save(out_path)
+    # Save full checkpoint alongside the kappa-only file so FeasibilityEstimator
+    # can load the critic without needing to hunt for the ep500 checkpoint.
+    full_ckpt_path = out_path.replace('.pth', '_full.pth')
+    torch.save({
+        'episode':    n_episodes,
+        'kappa_net':  kappa_net.state_dict(),
+        'critic':     critic.state_dict(),
+        'critic_tgt': critic_tgt.state_dict(),
+        'opt_kappa':  opt_kappa.state_dict(),
+        'opt_critic': opt_critic.state_dict(),
+    }, full_ckpt_path)
+    print(f'[checkpoint] full checkpoint saved → {full_ckpt_path}')
     _save_training_plots(run_dir, ep_rewards_log, ep_min_hs_log,
                          ep_steps_log, critic_losses_log, kappa_losses_log)
     return kappa_net

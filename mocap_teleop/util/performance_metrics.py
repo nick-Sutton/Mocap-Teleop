@@ -188,6 +188,7 @@ class PerformanceMetrics:
             'position_error_m', 'x_error_m', 'y_error_m',
             'velocity_error_ms',
             'heading_error_deg',
+            'joint_track_20cm_10deg',   # 1 if both within threshold, 0 otherwise
             'gait',
         ]
         with open(self._csv_path, 'w', newline='') as f:
@@ -293,12 +294,19 @@ class PerformanceMetrics:
         self.heading_errors.append(heading_error)
 
         # ── Velocity error ────────────────────────────────────────────────────
-        human_vel = _lin_vel(human_state.root_twist)
+        # Rotate human velocity from mocap frame into robot world frame using
+        # the same yaw offset applied to positions, so the vectors are comparable.
+        human_vel_raw = _lin_vel(human_state.root_twist)
+        yaw_off = float(self.coordinate_offset[2])
+        c, s = np.cos(yaw_off), np.sin(yaw_off)
+        human_vel = np.array([c * human_vel_raw[0] - s * human_vel_raw[1],
+                               s * human_vel_raw[0] + c * human_vel_raw[1],
+                               human_vel_raw[2]])
         if robot_twist is not None:
             robot_vel = _lin_vel(robot_twist)
         else:
             robot_vel = np.zeros(3)
-        vel_error = float(np.linalg.norm(human_vel - robot_vel))
+        vel_error = float(np.linalg.norm(human_vel[:2] - robot_vel[:2]))
         self.velocity_errors.append(vel_error)
 
         self.error_times.append(t)
@@ -316,6 +324,8 @@ class PerformanceMetrics:
             'y_error_m':        round(pos_diff[1], 4),
             'velocity_error_ms': round(vel_error, 4),
             'heading_error_deg': round(np.degrees(heading_error), 3),
+            'joint_track_20cm_10deg': int(
+                pos_error <= 0.20 and heading_error <= np.radians(10)),
             'gait':             gait or '',
         }
         with open(self._csv_path, 'a', newline='') as f:
@@ -344,6 +354,14 @@ class PerformanceMetrics:
         def rmse(a): return float(np.sqrt(np.mean(a**2)))
         def pct(a, thresh): return float(np.mean(a <= thresh) * 100)
 
+        # Position error normalised by human displacement from start (frames
+        # where the human hasn't moved > 1 cm are excluded to avoid div/0).
+        hpos     = np.array(self.human_positions)
+        h_disp   = np.linalg.norm(hpos - hpos[0], axis=1)
+        mov_mask = h_disp > 0.01
+        norm_pct_err = (pos[mov_mask] / h_disp[mov_mask] * 100
+                        if np.any(mov_mask) else np.array([0.0]))
+
         stats = {
             'overall': {
                 'duration_seconds':     float(self.frame_count * self.dt),
@@ -361,6 +379,8 @@ class PerformanceMetrics:
                 'accuracy_5cm_pct':   pct(pos, 0.05),
                 'accuracy_10cm_pct':  pct(pos, 0.10),
                 'accuracy_20cm_pct':  pct(pos, 0.20),
+                'norm_error_mean_pct':   float(np.mean(norm_pct_err)),
+                'norm_error_median_pct': float(np.median(norm_pct_err)),
             },
             'velocity_tracking': {
                 'mean_ms':            float(np.mean(vel)),
@@ -381,6 +401,15 @@ class PerformanceMetrics:
                 'accuracy_10deg_pct': pct(head, np.radians(10)),
                 'accuracy_20deg_pct': pct(head, np.radians(20)),
             },
+            # Joint tracking success: both position AND heading within threshold.
+            'joint_tracking': {
+                'pos20cm_head10deg_pct': float(
+                    np.mean((pos <= 0.20) & (head <= np.radians(10))) * 100),
+                'pos10cm_head5deg_pct':  float(
+                    np.mean((pos <= 0.10) & (head <= np.radians(5))) * 100),
+                'pos20cm_head5deg_pct':  float(
+                    np.mean((pos <= 0.20) & (head <= np.radians(5))) * 100),
+            },
             'gait_transitions': [
                 {'time_s': float(t), 'from': old, 'to': new}
                 for t, old, new in self.gait_transitions
@@ -398,13 +427,17 @@ class PerformanceMetrics:
                 continue
             pg = pos[mask]; vg = vel[mask]; hg = head[mask]
             per_gait[g] = {
-                'frames':            int(np.sum(mask)),
-                'duration_s':        float(np.sum(mask) * self.dt),
-                'position_rmse_m':   rmse(pg),
-                'position_mean_m':   float(np.mean(pg)),
-                'velocity_rmse_ms':  rmse(vg),
-                'heading_rmse_deg':  float(np.degrees(rmse(hg))),
-                'pos_10cm_pct':      pct(pg, 0.10),
+                'frames':                    int(np.sum(mask)),
+                'duration_s':                float(np.sum(mask) * self.dt),
+                'position_rmse_m':           rmse(pg),
+                'position_mean_m':           float(np.mean(pg)),
+                'velocity_rmse_ms':          rmse(vg),
+                'heading_rmse_deg':          float(np.degrees(rmse(hg))),
+                'pos_10cm_pct':              pct(pg, 0.10),
+                'joint_pos20cm_head10deg_pct': float(
+                    np.mean((pg <= 0.20) & (hg <= np.radians(10))) * 100),
+                'joint_pos10cm_head5deg_pct':  float(
+                    np.mean((pg <= 0.10) & (hg <= np.radians(5))) * 100),
             }
         stats['per_gait'] = per_gait
 
@@ -463,7 +496,9 @@ class PerformanceMetrics:
             w(f"  Max:         {p['max_m']*100:.2f} cm")
             w(f"  ≤ 5 cm:      {p['accuracy_5cm_pct']:.1f}%")
             w(f"  ≤ 10 cm:     {p['accuracy_10cm_pct']:.1f}%")
-            w(f"  ≤ 20 cm:     {p['accuracy_20cm_pct']:.1f}%"); w()
+            w(f"  ≤ 20 cm:     {p['accuracy_20cm_pct']:.1f}%")
+            w(f"  Norm error (mean):    {p['norm_error_mean_pct']:.1f}% of displacement")
+            w(f"  Norm error (median):  {p['norm_error_median_pct']:.1f}% of displacement"); w()
 
             v = stats['velocity_tracking']
             w('VELOCITY:'); w('-' * 40)
@@ -479,6 +514,13 @@ class PerformanceMetrics:
             w(f"  ≤ 5°:        {h['accuracy_5deg_pct']:.1f}%")
             w(f"  ≤ 10°:       {h['accuracy_10deg_pct']:.1f}%"); w()
 
+            jt = stats.get('joint_tracking', {})
+            if jt:
+                w('JOINT TRACKING (position AND heading):'); w('-' * 40)
+                w(f"  ≤20 cm & ≤10°:  {jt['pos20cm_head10deg_pct']:.1f}%")
+                w(f"  ≤20 cm &  ≤5°:  {jt['pos20cm_head5deg_pct']:.1f}%")
+                w(f"  ≤10 cm &  ≤5°:  {jt['pos10cm_head5deg_pct']:.1f}%"); w()
+
             if stats.get('per_gait'):
                 w('PER-GAIT:'); w('-' * 40)
                 for g, gd in stats['per_gait'].items():
@@ -486,7 +528,9 @@ class PerformanceMetrics:
                     w(f"    Pos RMSE: {gd['position_rmse_m']*100:.2f} cm  "
                       f"Vel RMSE: {gd['velocity_rmse_ms']:.3f} m/s  "
                       f"Head RMSE: {gd['heading_rmse_deg']:.2f}°")
-                    w(f"    ≤10cm: {gd['pos_10cm_pct']:.1f}%")
+                    w(f"    ≤10cm: {gd['pos_10cm_pct']:.1f}%  "
+                      f"Joint(≤20cm&≤10°): {gd['joint_pos20cm_head10deg_pct']:.1f}%  "
+                      f"Joint(≤10cm&≤5°): {gd['joint_pos10cm_head5deg_pct']:.1f}%")
                 w()
 
             if stats['gait_transitions']:
@@ -519,6 +563,7 @@ class PerformanceMetrics:
         plt.close('all')
         self._plot_position()
         self._plot_tracking()
+        self._plot_per_gait_summary()
         self._plot_gait_features()
         self._plot_frequencies()
         self.save_summary()
@@ -701,6 +746,60 @@ class PerformanceMetrics:
         plt.close(fig)
         print(f"[PLOT] {path}")
 
+    def _plot_per_gait_summary(self) -> None:
+        """Poster-ready bar chart summarising all key metrics broken down by gait."""
+        stats = self.compute_summary_statistics()
+        pg    = stats.get('per_gait', {})
+        if not pg:
+            return
+
+        gaits        = [g for g in ['stand', 'walk', 'jog'] if g in pg]
+        colors       = [GAIT_COLORS.get(g, DEFAULT_GAIT_COLOR) for g in gaits]
+        labels       = [g.capitalize() for g in gaits]
+        x            = np.arange(len(gaits))
+        bar_w        = 0.55
+
+        pos_rmse  = [pg[g]['position_rmse_m'] * 100  for g in gaits]
+        head_rmse = [pg[g]['heading_rmse_deg']        for g in gaits]
+        track_acc = [pg[g]['joint_pos20cm_head10deg_pct'] for g in gaits]
+        pos_10cm  = [pg[g]['pos_10cm_pct']            for g in gaits]
+        duration  = [pg[g]['duration_s']              for g in gaits]
+
+        fig, axes = plt.subplots(2, 2, figsize=(10, 8))
+        fig.suptitle('Per-Gait Performance Breakdown', fontsize=13, fontweight='bold')
+        axes = axes.flatten()
+
+        def _bar(ax, values, ylabel, title, fmt='{:.1f}', unit='', ref100=False):
+            bars = ax.bar(x, values, width=bar_w, color=colors, alpha=0.85,
+                          edgecolor='white', linewidth=1.2)
+            for bar, val in zip(bars, values):
+                ax.text(bar.get_x() + bar.get_width() / 2,
+                        bar.get_height() + max(values) * 0.02,
+                        fmt.format(val) + unit,
+                        ha='center', va='bottom', fontsize=10, fontweight='bold')
+            ax.set_xticks(x)
+            ax.set_xticklabels(
+                [f'{lbl}\n({dur:.0f}s)' for lbl, dur in zip(labels, duration)],
+                fontsize=10)
+            ax.set_ylabel(ylabel, fontsize=10)
+            ax.set_title(title, fontsize=11, fontweight='bold')
+            ax.set_ylim(0, 115 if ref100 else max(values) * 1.25)
+            if ref100:
+                ax.axhline(100, color='#2C3E50', lw=1, ls='--', alpha=0.4)
+            ax.grid(axis='y', alpha=0.3)
+            ax.spines[['top', 'right']].set_visible(False)
+
+        _bar(axes[0], pos_rmse,  'RMSE (cm)',  'Position RMSE',                        unit=' cm')
+        _bar(axes[1], head_rmse, 'RMSE (°)',   'Heading RMSE',                         unit='°')
+        _bar(axes[2], pos_10cm,  'Frames (%)', 'Frames Within 10 cm',                  unit='%', ref100=True)
+        _bar(axes[3], track_acc, 'Frames (%)', 'Tracking Accuracy\n(≤ 20 cm & ≤ 10°)', unit='%', ref100=True)
+
+        plt.tight_layout()
+        path = os.path.join(self._run_dir, 'per_gait_summary.png')
+        plt.savefig(path, dpi=300, bbox_inches='tight')
+        plt.close(fig)
+        print(f"[PLOT] {path}")
+
     def _plot_gait_features(self) -> None:
         if not self.lfoot_positions:
             return
@@ -807,10 +906,16 @@ class PerformanceMetrics:
         print(f"  Position RMSE:  {p['rmse_m']*100:.2f} cm   "
               f"(≤5cm: {p['accuracy_5cm_pct']:.0f}%  "
               f"≤10cm: {p['accuracy_10cm_pct']:.0f}%)")
+        print(f"  Norm pos error: {p['norm_error_mean_pct']:.1f}% of displacement  "
+              f"(median {p['norm_error_median_pct']:.1f}%)")
         print(f"  Velocity RMSE:  {v['rmse_ms']:.3f} m/s  "
               f"(≤0.2m/s: {v['accuracy_02ms_pct']:.0f}%)")
         print(f"  Heading RMSE:   {h['rmse_deg']:.2f}°      "
               f"(≤10°: {h['accuracy_10deg_pct']:.0f}%)")
+        jt = stats.get('joint_tracking', {})
+        if jt:
+            print(f"  Joint tracking: {jt['pos20cm_head10deg_pct']:.1f}% (≤20cm & ≤10°)  "
+                  f"{jt['pos10cm_head5deg_pct']:.1f}% (≤10cm & ≤5°)")
         print(f"  Transitions:    {stats['overall']['num_gait_transitions']}")
         if stats.get('component_frequency'):
             cf = stats['component_frequency']

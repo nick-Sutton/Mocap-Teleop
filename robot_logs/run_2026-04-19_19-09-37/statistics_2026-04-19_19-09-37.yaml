@@ -1,0 +1,66 @@
+overall:
+  duration_seconds: 0.004166666666666667
+  total_frames: 1
+  num_gait_transitions: 0
+position_tracking:
+  mean_m: 0.0009920504019454099
+  std_m: 0.0
+  median_m: 0.0009920504019454099
+  max_m: 0.0009920504019454099
+  rmse_m: 0.0009920504019454099
+  p95_m: 0.0009920504019454099
+  p99_m: 0.0009920504019454099
+  accuracy_5cm_pct: 100.0
+  accuracy_10cm_pct: 100.0
+  accuracy_20cm_pct: 100.0
+velocity_tracking:
+  mean_ms: 0.058342217990059425
+  std_ms: 0.0
+  median_ms: 0.058342217990059425
+  max_ms: 0.058342217990059425
+  rmse_ms: 0.058342217990059425
+  accuracy_01ms_pct: 100.0
+  accuracy_02ms_pct: 100.0
+  accuracy_05ms_pct: 100.0
+heading_tracking:
+  mean_deg: 1.8359133050034744
+  std_deg: 0.0
+  max_deg: 1.8359133050034744
+  rmse_deg: 1.8359133050034744
+  accuracy_5deg_pct: 100.0
+  accuracy_10deg_pct: 100.0
+  accuracy_20deg_pct: 100.0
+gait_transitions: []
+per_gait:
+  walk:
+    frames: 1
+    duration_s: 0.004166666666666667
+    position_rmse_m: 0.0009920504019454099
+    position_mean_m: 0.0009920504019454099
+    velocity_rmse_ms: 0.058342217990059425
+    heading_rmse_deg: 1.8359133050034744
+    pos_10cm_pct: 100.0
+component_frequency:
+  mocap:
+    nominal_hz: 240.0
+    mean_hz: 30.682911532956325
+    std_hz: 7.771947865682168
+    min_hz: 21.491360013814152
+    max_hz: 41.79350635415838
+    within_5pct: 0.0
+  classifier:
+    nominal_hz: 20.0
+    mean_hz: 0.0
+    std_hz: 0.0
+    min_hz: 0.0
+    max_hz: 0.0
+    within_5pct: 0.0
+  pd_ctrl:
+    nominal_hz: 500.0
+    mean_hz: 0.0
+    std_hz: 0.0
+    min_hz: 0.0
+    max_hz: 0.0
+    within_5pct: 0.0
+  num_samples: 6
+  duration_s: 6.50264048576355

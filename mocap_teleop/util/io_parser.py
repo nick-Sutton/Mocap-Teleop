@@ -35,7 +35,7 @@ def parse_learning_config() -> dict:
     ws_root   = os.path.normpath(os.path.join(pkg_share, '..', '..', '..', '..'))
     src_dir   = os.path.join(ws_root, 'src', 'mocap_teleop')
 
-    for key in ('gait_classifier_path', 'cbf_model_path'):
+    for key in ('gait_classifier_path', 'cbf_model_path', 'critic_path'):
         raw = cfg.get(key, '')
         if raw and not os.path.isabs(raw):
             cfg[key] = os.path.join(src_dir, raw)

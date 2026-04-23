@@ -1,0 +1,74 @@
+overall:
+  duration_seconds: 11.616666666666667
+  total_frames: 2788
+  num_gait_transitions: 0
+position_tracking:
+  mean_m: 0.11921458733340964
+  std_m: 0.04981772881432477
+  median_m: 0.13934545033154383
+  max_m: 0.196295916276071
+  rmse_m: 0.1292049687020308
+  p95_m: 0.17603291644228936
+  p99_m: 0.19217128953661602
+  accuracy_5cm_pct: 14.239598278335725
+  accuracy_10cm_pct: 31.456241032998566
+  accuracy_20cm_pct: 100.0
+  norm_error_mean_pct: 14.294123946129504
+  norm_error_median_pct: 6.027660830314425
+velocity_tracking:
+  mean_ms: 1.4458104280756534
+  std_ms: 0.8967020091352084
+  median_ms: 1.5840808775741062
+  max_ms: 3.1621104690376116
+  rmse_ms: 1.7013060533365016
+  accuracy_01ms_pct: 10.868005738880917
+  accuracy_02ms_pct: 13.809182209469153
+  accuracy_05ms_pct: 22.13055954088953
+heading_tracking:
+  mean_deg: 2.7898985414528665
+  std_deg: 1.5999689434746898
+  max_deg: 6.644721326029016
+  rmse_deg: 3.2161210318774303
+  accuracy_5deg_pct: 91.71449067431851
+  accuracy_10deg_pct: 100.0
+  accuracy_20deg_pct: 100.0
+joint_tracking:
+  pos20cm_head10deg_pct: 100.0
+  pos10cm_head5deg_pct: 31.456241032998566
+  pos20cm_head5deg_pct: 91.71449067431851
+gait_transitions: []
+per_gait:
+  walk:
+    frames: 2788
+    duration_s: 11.616666666666667
+    position_rmse_m: 0.1292049687020308
+    position_mean_m: 0.11921458733340964
+    velocity_rmse_ms: 1.7013060533365016
+    heading_rmse_deg: 3.2161210318774303
+    pos_10cm_pct: 31.456241032998566
+    joint_pos20cm_head10deg_pct: 100.0
+    joint_pos10cm_head5deg_pct: 31.456241032998566
+component_frequency:
+  mocap:
+    nominal_hz: 240.0
+    mean_hz: 240.03822954867567
+    std_hz: 0.0555375042786915
+    min_hz: 239.97388618716903
+    max_hz: 240.15408693758022
+    within_5pct: 100.0
+  classifier:
+    nominal_hz: 20.0
+    mean_hz: 20.580601828149398
+    std_hz: 0.711310122839716
+    min_hz: 19.972553672359375
+    max_hz: 22.109495827697756
+    within_5pct: 83.33333333333334
+  pd_ctrl:
+    nominal_hz: 500.0
+    mean_hz: 479.3932872116143
+    std_hz: 4.365004397800845
+    min_hz: 471.12497849238434
+    max_hz: 485.85835400295366
+    within_5pct: 83.33333333333334
+  num_samples: 6
+  duration_s: 6.0043933391571045

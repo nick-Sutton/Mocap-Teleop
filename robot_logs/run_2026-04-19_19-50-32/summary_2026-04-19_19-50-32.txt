@@ -1,0 +1,55 @@
+================================================================================
+TELEOP PERFORMANCE METRICS SUMMARY
+================================================================================
+
+OVERALL:
+----------------------------------------
+  Duration:          12.48 s
+  Frames:            2995
+  Gait transitions:  1
+
+POSITION:
+----------------------------------------
+  Mean ± Std:  13.60 ± 6.72 cm
+  RMSE:        15.17 cm
+  Median:      15.07 cm
+  Max:         23.73 cm
+  ≤ 5 cm:      20.4%
+  ≤ 10 cm:     30.9%
+  ≤ 20 cm:     81.1%
+
+VELOCITY:
+----------------------------------------
+  Mean ± Std:  0.326 ± 0.336 m/s
+  RMSE:        0.468 m/s
+  ≤ 0.1 m/s:   29.4%
+  ≤ 0.2 m/s:   52.4%
+
+HEADING:
+----------------------------------------
+  Mean ± Std:  2.88 ± 1.62°
+  RMSE:        3.30°
+  ≤ 5°:        95.0%
+  ≤ 10°:       100.0%
+
+PER-GAIT:
+----------------------------------------
+  STAND (2.9s, 689 frames)
+    Pos RMSE: 4.86 cm  Vel RMSE: 0.248 m/s  Head RMSE: 4.08°
+    ≤10cm: 98.4%
+  WALK (9.6s, 2306 frames)
+    Pos RMSE: 17.08 cm  Vel RMSE: 0.516 m/s  Head RMSE: 3.03°
+    ≤10cm: 10.8%
+
+TRANSITIONS:
+----------------------------------------
+  t=5.32s: walk → stand
+
+COMPONENT FREQUENCY:
+----------------------------------------
+  Samples logged: 6  (over 6.0 s)
+  Mocap        nominal=240 Hz  mean=240.0  std=0.0  min=240.0  max=240.1  within±5%=100.0%
+  Classifier   nominal=20 Hz  mean=20.5  std=0.6  min=20.0  max=21.8  within±5%=83.3%
+  PD Ctrl      nominal=500 Hz  mean=480.0  std=1.0  min=478.4  max=481.0  within±5%=100.0%
+
+================================================================================
